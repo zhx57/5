@@ -235,6 +235,28 @@ jobs:
         with:
           pattern: tbsign_go.musl.*.docker
 
+      - name: Prepare Docker build context
+        run: |
+          mkdir -p docker
+          
+          # 为每个架构准备对应的二进制文件
+          if [ -f "tbsign_go.musl.amd64.docker/tbsign_go" ]; then
+            cp tbsign_go.musl.amd64.docker/tbsign_go docker/tbsign_go.linux-amd64
+            echo "✅ amd64 binary prepared"
+          else
+            echo "⚠️ amd64 binary not found"
+          fi
+          
+          if [ -f "tbsign_go.musl.arm64.docker/tbsign_go" ]; then
+            cp tbsign_go.musl.arm64.docker/tbsign_go docker/tbsign_go.linux-arm64
+            echo "✅ arm64 binary prepared"
+          else
+            echo "⚠️ arm64 binary not found"
+          fi
+          
+          echo "=== Prepared files ==="
+          ls -la docker/ || echo "No files in docker directory"
+
       - name: Set Up QEMU
         uses: docker/setup-qemu-action@v3
 
