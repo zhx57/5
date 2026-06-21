@@ -868,6 +868,19 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 		}
 	}
 
+	// 应用每分钟最大执行数限制：随机挑选任务，与 PHP 版“随机一条回复”语义一致
+	actionLimitStr := _function.GetOption("weltolk_autoreply_action_limit")
+	actionLimit, _ := strconv.Atoi(actionLimitStr)
+	if actionLimit < 0 {
+		actionLimit = 0
+	}
+	if actionLimit > 0 && len(tasks) > actionLimit {
+		mrand.Shuffle(len(tasks), func(i, j int) {
+			tasks[i], tasks[j] = tasks[j], tasks[i]
+		})
+		tasks = tasks[:actionLimit]
+	}
+
 	for _, task := range tasks {
 		atUsername := ""
 		atPortrait := ""
@@ -892,20 +905,24 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 			continue
 		}
 
-		var bind model.TcBaiduid
-		if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", task.UID).Order("id ASC").Take(&bind).Error; err != nil {
-			slog.Debug("plugin.weltolk-autoreply.action.no-bind", "id", taskID, "uid", task.UID, "error", err)
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             task.Pid,
-				"last_status":     "error",
-				"last_error":      "未找到贴吧绑定信息",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：未找到贴吧绑定信息<br>", logTime))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
+		// 使用任务保存时指定的百度账号 pid，避免小号被覆盖成大号
+		pid := task.Pid
+		if pid <= 0 {
+			var bind model.TcBaiduid
+			if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", task.UID).Order("id ASC").Take(&bind).Error; err != nil {
+				slog.Debug("plugin.weltolk-autoreply.action.no-bind", "id", taskID, "uid", task.UID, "error", err)
+				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+					"pid":             task.Pid,
+					"last_status":     "error",
+					"last_error":      "未找到贴吧绑定信息",
+					"last_check_time": now,
+				})
+				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：未找到贴吧绑定信息<br>", logTime))
+				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
+				continue
+			}
+			pid = bind.ID
 		}
-		pid := bind.ID
 
 		cookie := _function.GetCookie(pid, true)
 		if cookie == nil || cookie.Bduss == "" {
