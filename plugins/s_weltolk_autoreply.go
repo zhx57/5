@@ -70,6 +70,7 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 			{Method: http.MethodPost, Path: "switch", Function: PluginWeltolkAutoReplySwitch},
 			{Method: http.MethodGet, Path: "list", Function: PluginWeltolkAutoReplyList},
 			{Method: http.MethodPatch, Path: "list", Function: PluginWeltolkAutoReplyListAdd},
+			{Method: http.MethodPut, Path: "list/:id", Function: PluginWeltolkAutoReplyListEdit},
 			{Method: http.MethodDelete, Path: "list/:id", Function: PluginWeltolkAutoReplyListDelete},
 			{Method: http.MethodPost, Path: "list/empty", Function: PluginWeltolkAutoReplyListEmpty},
 			{Method: http.MethodPost, Path: "test", Function: PluginWeltolkAutoReplyTest},
@@ -1472,6 +1473,81 @@ func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
 	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyListEdit(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// Verify task exists and belongs to user
+	var existingTask model.TcWeltolkAutoreplyTasks
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Take(&existingTask).Error; err != nil {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "任务不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	binding := new(weltolkAutoReplyListAddBinding)
+	if err := c.Bind(binding); err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+	numUID, _ := strconv.Atoi(uid)
+
+	// Validate pid if provided
+	if binding.Pid > 0 {
+		var count int64
+		if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", binding.Pid, numUID).Count(&count).Error; err != nil || count == 0 {
+			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "越权操作：该百度账号不属于您", _function.EchoEmptyObject, "tbsign"))
+		}
+	}
+
+	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || strings.TrimSpace(binding.ReplyContent) == "" {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	if binding.ReplyInterval <= 0 {
+		binding.ReplyInterval = 300
+	}
+	if binding.ReplyProbability <= 0 || binding.ReplyProbability > 100 {
+		binding.ReplyProbability = 100
+	}
+	if binding.TriggerMode == "" {
+		binding.TriggerMode = "new_floor"
+	}
+	if binding.ReplyTarget == "" {
+		binding.ReplyTarget = "floor"
+	}
+	if binding.Enabled != 0 && binding.Enabled != 1 {
+		binding.Enabled = 1
+	}
+
+	updates := map[string]any{
+		"fname":             strings.TrimSpace(binding.Fname),
+		"tid":               binding.Tid,
+		"reply_content":     binding.ReplyContent,
+		"reply_interval":    binding.ReplyInterval,
+		"reply_probability": binding.ReplyProbability,
+		"trigger_mode":      binding.TriggerMode,
+		"reply_target":      binding.ReplyTarget,
+		"allow_replied":     binding.AllowReplied,
+		"match_keywords":    binding.MatchKeywords,
+		"enabled":           binding.Enabled,
+	}
+	if binding.Pid > 0 {
+		updates["pid"] = binding.Pid
+	}
+
+	if err := _function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Updates(updates).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.list.edit", "uid", uid, "id", id, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// Read updated task
+	var updatedTask model.TcWeltolkAutoreplyTasks
+	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", id).Take(&updatedTask)
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", updatedTask, "tbsign"))
 }
 
 func PluginWeltolkAutoReplyListDelete(c echo.Context) error {
