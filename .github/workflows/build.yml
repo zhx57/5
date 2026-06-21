@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v6
         name: Clone frontend
         with:
-          repository: "BANKA2017/tbsign_go_fe"
+          repository: "zhx57/33"
           path: tbsign_go_fe
 
       - uses: actions/setup-node@v4
