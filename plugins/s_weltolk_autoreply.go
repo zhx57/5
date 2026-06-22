@@ -69,9 +69,8 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameFE:      "weltolk_autoreply",
 		Version:           "1.0",
 		Options: map[string]string{
-			"weltolk_autoreply_limit":        "5",
-			"weltolk_autoreply_id":           "0",
-			"weltolk_autoreply_action_limit": "50",
+			"weltolk_autoreply_limit": "5",
+			"weltolk_autoreply_id":    "0",
 		},
 		SettingOptions: map[string]PluginSettingOption{
 			"weltolk_autoreply_limit": {
@@ -79,13 +78,6 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 				OptionNameCN: "默认任务数量上限",
 				Validate: &_function.OptionRule{
 					Min: _function.VPtr(int64(1)),
-				},
-			},
-			"weltolk_autoreply_action_limit": {
-				OptionName:   "weltolk_autoreply_action_limit",
-				OptionNameCN: "每分钟最大执行数",
-				Validate: &_function.OptionRule{
-					Min: _function.VPtr(int64(0)),
 				},
 			},
 		},
