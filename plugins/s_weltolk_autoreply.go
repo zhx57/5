@@ -69,18 +69,9 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameFE:      "weltolk_autoreply",
 		Version:           "1.0",
 		Options: map[string]string{
-			"weltolk_autoreply_limit": "5",
-			"weltolk_autoreply_id":    "0",
+			"weltolk_autoreply_id": "0",
 		},
-		SettingOptions: map[string]PluginSettingOption{
-			"weltolk_autoreply_limit": {
-				OptionName:   "weltolk_autoreply_limit",
-				OptionNameCN: "默认任务数量上限",
-				Validate: &_function.OptionRule{
-					Min: _function.VPtr(int64(1)),
-				},
-			},
-		},
+		SettingOptions: map[string]PluginSettingOption{},
 		Endpoints: []PluginEndpointStruct{
 			{Method: http.MethodGet, Path: "switch", Function: PluginWeltolkAutoReplyGetSwitch},
 			{Method: http.MethodPost, Path: "switch", Function: PluginWeltolkAutoReplySwitch},
@@ -91,29 +82,14 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 			{Method: http.MethodPost, Path: "list/:id/toggle", Function: PluginWeltolkAutoReplyListToggle},
 			{Method: http.MethodPost, Path: "list/empty", Function: PluginWeltolkAutoReplyListEmpty},
 			{Method: http.MethodPost, Path: "test", Function: PluginWeltolkAutoReplyTest},
-			{Method: http.MethodGet, Path: "settings", Function: PluginWeltolkAutoReplySettings},
-			{Method: http.MethodPut, Path: "settings", Function: PluginWeltolkAutoReplySettingsUpdate},
 		},
 	},
 })
 
 const weltolkAutoreplyOpenKey = "weltolk_autoreply_open"
-const weltolkAutoreplyLimitKey = "weltolk_autoreply_limit"
 const weltolkAutoreplyHighWaterKey = "weltolk_autoreply_high_water"
 
 // helpers
-
-func weltolkAutoreplyGetUserLimit(uid string) int {
-	personal := _function.GetUserOption(weltolkAutoreplyLimitKey, uid)
-	if p, err := strconv.Atoi(personal); err == nil && p > 0 {
-		return p
-	}
-	global := _function.GetOption(weltolkAutoreplyLimitKey)
-	if g, err := strconv.Atoi(global); err == nil && g > 0 {
-		return g
-	}
-	return 5
-}
 
 // calcEffectiveInterval 计算实际回复间隔
 // 使用 seed 确保同一任务在同一 LastReplyTime 下计算出的间隔稳定，
@@ -1232,6 +1208,19 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		atUsername = latest.Username
 		atPortrait = latest.Portrait
 		subPostID = ""
+		// 回复目标为楼中楼时，回复最新楼层的第一个楼中楼（如果有）
+		if replyTarget == "subpost" && len(latest.SubPosts) > 0 {
+			for _, sp := range latest.SubPosts {
+				if strings.TrimSpace(sp.Content) == "" {
+					continue
+				}
+				subPostID = strconv.FormatInt(sp.ID, 10)
+				replyUID = strconv.FormatInt(sp.AuthorID, 10)
+				atUsername = sp.Username
+				atPortrait = sp.Portrait
+				break
+			}
+		}
 	}
 
 	if triggerMode == "keyword" {
@@ -1368,7 +1357,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		"{username}", atUsername,
 	).Replace(replyContent)
 
-	if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
+	if replyTarget == "subpost" && subPostID != "" && atUsername != "" {
 		finalContent = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, finalContent)
 	}
 
@@ -1475,7 +1464,6 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Delete() error {
 	}
 	DeletePluginInfo(pluginInfo.Name)
 	_function.GormDB.W.Migrator().DropTable(&model.TcWeltolkAutoreplyTasks{})
-	_function.GormDB.W.Where("name = ?", weltolkAutoreplyLimitKey).Delete(&model.TcUsersOption{})
 	_function.GormDB.W.Where("name = ?", weltolkAutoreplyOpenKey).Delete(&model.TcUsersOption{})
 	return nil
 }
@@ -1527,10 +1515,6 @@ func (pluginInfo *WeltolkAutoReplyPluginType) ExportAccount(uid int32, tx *gorm.
 	err := tx.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Find(&exportData).Error
 	return map[string]any{
 		tableName: exportData,
-		"tc_users_options": _function.GetUserOptionBatch(strconv.Itoa(int(uid)), _function.OptionExt{
-			Tx:      tx,
-			KeyName: weltolkAutoreplyLimitKey,
-		}),
 	}, err
 }
 
@@ -1588,11 +1572,9 @@ func PluginWeltolkAutoReplyList(c echo.Context) error {
 	uid := c.Get("uid").(string)
 	var tasks []*model.TcWeltolkAutoreplyTasks
 	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Order("id DESC").Find(&tasks)
-	limit := weltolkAutoreplyGetUserLimit(uid)
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
 		"tasks": tasks,
 		"count": len(tasks),
-		"limit": limit,
 	}, "tbsign"))
 }
 
@@ -1631,13 +1613,6 @@ func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 
 	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || (strings.TrimSpace(binding.ReplyContent) == "" && strings.TrimSpace(binding.ReplyContentList) == "") {
 		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	limit := weltolkAutoreplyGetUserLimit(uid)
-	var userCount int64
-	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", numUID).Count(&userCount)
-	if int(userCount) >= limit {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, fmt.Sprintf("已达到最大任务数限制（%d 条）", limit), _function.EchoEmptyObject, "tbsign"))
 	}
 
 	if binding.ReplyInterval <= 0 {
@@ -1963,6 +1938,19 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 			floorNum = strconv.FormatInt(latest.Floor, 10)
 			atUsername = latest.Username
 			atPortrait = latest.Portrait
+			// 回复目标为楼中楼时，回复最新楼层的第一个楼中楼（如果有）
+			if replyTarget == "subpost" && len(latest.SubPosts) > 0 {
+				for _, sp := range latest.SubPosts {
+					if strings.TrimSpace(sp.Content) == "" {
+						continue
+					}
+					subPostID = strconv.FormatInt(sp.ID, 10)
+					replyUID = strconv.FormatInt(sp.AuthorID, 10)
+					atUsername = sp.Username
+					atPortrait = sp.Portrait
+					break
+				}
+			}
 		}
 	}
 
@@ -1979,62 +1967,10 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 		"{username}", atUsername,
 	).Replace(binding.ReplyContent)
 
-	if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
+	if replyTarget == "subpost" && subPostID != "" && atUsername != "" {
 		content = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, content)
 	}
 
 	result := autoreplyAddPost(bduss, stoken, tbs, binding.Fname, fid, binding.Tid, content, "贴吧用户", quoteID, replyUID, floorNum, subPostID)
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", result, "tbsign"))
-}
-
-func PluginWeltolkAutoReplySettings(c echo.Context) error {
-	uid := c.Get("uid").(string)
-	global := _function.GetOption(weltolkAutoreplyLimitKey)
-	if global == "" {
-		global = "5"
-	}
-	personal := _function.GetUserOption(weltolkAutoreplyLimitKey, uid)
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]string{
-		"global_limit":   global,
-		"personal_limit": personal,
-	}, "tbsign"))
-}
-
-type weltolkAutoReplySettingsUpdateBinding struct {
-	GlobalLimit   *int `json:"global_limit" form:"global_limit"`
-	PersonalLimit *int `json:"personal_limit" form:"personal_limit"`
-}
-
-func PluginWeltolkAutoReplySettingsUpdate(c echo.Context) error {
-	uid := c.Get("uid").(string)
-	role, _ := c.Get("role").(string)
-	isAdmin := role == _function.RoleAdmin
-
-	binding := new(weltolkAutoReplySettingsUpdateBinding)
-	if err := c.Bind(binding); err != nil {
-		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	if binding.GlobalLimit != nil {
-		if !isAdmin {
-			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无权修改全局限额", _function.EchoEmptyObject, "tbsign"))
-		}
-		if *binding.GlobalLimit < 1 {
-			*binding.GlobalLimit = 1
-		}
-		if err := _function.SetOption(weltolkAutoreplyLimitKey, *binding.GlobalLimit); err != nil {
-			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
-		}
-	}
-
-	if binding.PersonalLimit != nil {
-		if *binding.PersonalLimit < 0 {
-			*binding.PersonalLimit = 0
-		}
-		if err := _function.SetUserOption(weltolkAutoreplyLimitKey, *binding.PersonalLimit, uid); err != nil {
-			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
-		}
-	}
-
-	return PluginWeltolkAutoReplySettings(c)
 }
