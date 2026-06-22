@@ -1359,7 +1359,8 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Install() error {
 	if err != nil {
 		return err
 	}
-	return _function.GormDB.W.Migrator().CreateTable(&model.TcWeltolkAutoreplyTasks{})
+	// AutoMigrate 同时支持创建新表和添加新列，确保升级后新字段存在
+	return _function.GormDB.W.AutoMigrate(&model.TcWeltolkAutoreplyTasks{})
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Delete() error {
