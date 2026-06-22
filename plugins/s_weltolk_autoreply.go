@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,6 +42,24 @@ type WeltolkAutoReplyPluginType struct {
 
 // autoreplyRand 是插件独立的随机数生成器，避免并发使用全局 math/rand
 var autoreplyRand = mrand.New(mrand.NewSource(time.Now().UnixNano()))
+var autoreplyRandMu sync.Mutex
+
+// autoreplyRandIntn 返回 [0, n) 的非负伪随机数，线程安全
+func autoreplyRandIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	autoreplyRandMu.Lock()
+	defer autoreplyRandMu.Unlock()
+	return autoreplyRand.Intn(n)
+}
+
+// autoreplyRandInt63 返回 [0, 1<<63) 的非负伪随机数，线程安全
+func autoreplyRandInt63() int64 {
+	autoreplyRandMu.Lock()
+	defer autoreplyRandMu.Unlock()
+	return autoreplyRand.Int63()
+}
 
 var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 	PluginInfo{
@@ -50,11 +69,9 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameFE:      "weltolk_autoreply",
 		Version:           "1.0",
 		Options: map[string]string{
-			"weltolk_autoreply_limit":            "5",
-			"weltolk_autoreply_id":               "0",
-			"weltolk_autoreply_action_limit":     "50",
-			"weltolk_autoreply_global_cooldown":  "0",
-			"weltolk_autoreply_last_global_reply": "0",
+			"weltolk_autoreply_limit":        "5",
+			"weltolk_autoreply_id":           "0",
+			"weltolk_autoreply_action_limit": "50",
 		},
 		SettingOptions: map[string]PluginSettingOption{
 			"weltolk_autoreply_limit": {
@@ -67,13 +84,6 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 			"weltolk_autoreply_action_limit": {
 				OptionName:   "weltolk_autoreply_action_limit",
 				OptionNameCN: "每分钟最大执行数",
-				Validate: &_function.OptionRule{
-					Min: _function.VPtr(int64(0)),
-				},
-			},
-			"weltolk_autoreply_global_cooldown": {
-				OptionName:   "weltolk_autoreply_global_cooldown",
-				OptionNameCN: "全局回复冷却时间（秒）",
 				Validate: &_function.OptionRule{
 					Min: _function.VPtr(int64(0)),
 				},
@@ -98,8 +108,6 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 const weltolkAutoreplyOpenKey = "weltolk_autoreply_open"
 const weltolkAutoreplyLimitKey = "weltolk_autoreply_limit"
 const weltolkAutoreplyHighWaterKey = "weltolk_autoreply_high_water"
-const weltolkAutoreplyGlobalCooldownKey = "weltolk_autoreply_global_cooldown"
-const weltolkAutoreplyLastGlobalReplyKey = "weltolk_autoreply_last_global_reply"
 
 // helpers
 
@@ -116,27 +124,45 @@ func weltolkAutoreplyGetUserLimit(uid string) int {
 }
 
 // calcEffectiveInterval 计算实际回复间隔
+// 使用 seed 确保同一任务在同一 LastReplyTime 下计算出的间隔稳定，
+// 避免每次 cron tick 都重新随机导致间隔不断变化、任务可能永远无法执行。
 // 规则：min>0 && max>=min -> [min, max]
 //      min>0 && max<min  -> min（按min固定）
 //      min<=0 && max>0   -> [60, max]，避免0导致疯狂回复
 //      min<=0 && max<=0  -> 使用旧的 reply_interval 字段，若仍<=0则默认60
-func calcEffectiveInterval(replyIntervalMin, replyIntervalMax, replyInterval int32) int32 {
-	min := replyIntervalMin
-	max := replyIntervalMax
+func calcEffectiveInterval(replyIntervalMin, replyIntervalMax, replyInterval int32, seed int64) int32 {
+	minVal := replyIntervalMin
+	maxVal := replyIntervalMax
 
-	if min > 0 && max >= min {
-		return min + int32(autoreplyRand.Intn(int(max-min)+1))
+	if minVal > 0 && maxVal >= minVal {
+		if maxVal == minVal {
+			return minVal
+		}
+		span := int64(maxVal - minVal + 1)
+		offset := seed % span
+		if offset < 0 {
+			offset = -offset
+		}
+		return minVal + int32(offset)
 	}
-	if min > 0 {
-		return min
+	if minVal > 0 {
+		return minVal
 	}
-	if max > 0 {
+	if maxVal > 0 {
 		// 只设置了最大值，给一个合理下限避免过频
 		lower := int32(60)
-		if max < lower {
-			lower = max
+		if maxVal < lower {
+			lower = maxVal
 		}
-		return lower + int32(autoreplyRand.Intn(int(max-lower)+1))
+		if maxVal == lower {
+			return lower
+		}
+		span := int64(maxVal - lower + 1)
+		offset := seed % span
+		if offset < 0 {
+			offset = -offset
+		}
+		return lower + int32(offset)
 	}
 	if replyInterval > 0 {
 		return replyInterval
@@ -588,6 +614,34 @@ func autoreplyIsTimeout(err error) bool {
 	return false
 }
 
+// autoreplyIsRetryableErr 判断错误是否值得重试（网络抖动、连接重置等瞬态错误）
+func autoreplyIsRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if autoreplyIsTimeout(err) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	s := err.Error()
+	if strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "no such host") ||
+		strings.Contains(s, "server closed connection") {
+		return true
+	}
+	return false
+}
+
 func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(context.Context) (*http.Response, error)) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -609,7 +663,8 @@ func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(co
 		resp, err := do(attemptCtx)
 		cancel()
 		if err == nil {
-			if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			// 429 Too Many Requests 和 5xx 服务端错误值得重试
+			if resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
 				lastErr = fmt.Errorf("server returned status %d", resp.StatusCode)
 				resp.Body.Close()
 				continue
@@ -617,7 +672,7 @@ func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(co
 			return resp, nil
 		}
 		lastErr = err
-		if !autoreplyIsTimeout(err) {
+		if !autoreplyIsRetryableErr(err) {
 			return nil, err
 		}
 	}
@@ -664,8 +719,12 @@ func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content,
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var raw bytes.Buffer
-		io.CopyN(&raw, resp.Body, 128)
-		return autoreplyAddPostResult{Success: false, ErrorCode: resp.StatusCode, ErrorMsg: "HTTP Error: " + strconv.Itoa(resp.StatusCode)}
+		io.CopyN(&raw, resp.Body, 512)
+		errMsg := "HTTP Error: " + strconv.Itoa(resp.StatusCode)
+		if raw.Len() > 0 {
+			errMsg += " body: " + raw.String()
+		}
+		return autoreplyAddPostResult{Success: false, ErrorCode: resp.StatusCode, ErrorMsg: errMsg}
 	}
 
 	var reader io.Reader = resp.Body
@@ -679,6 +738,9 @@ func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content,
 	response, err := io.ReadAll(reader)
 	if err != nil {
 		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "Read Error: " + err.Error()}
+	}
+	if len(response) == 0 {
+		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "empty response body"}
 	}
 
 	errorno, errmsg, needVcode := autoreplyParseResponse(response)
@@ -803,9 +865,9 @@ func weltolkParseAuthorName(author any, authorID int64) string {
 
 func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[string]any, error) {
 	secret := "tiebaclient!!!"
-	stTime := autoreplyRand.Intn(751) + 100
-	stSize := int64(math.Round((float64(autoreplyRand.Int63())/float64(math.MaxInt64)*8 + 0.4) * float64(stTime)))
-	cuid := fmt.Sprintf("baidutiebaapp%08d", autoreplyRand.Intn(90000000)+10000000)
+	stTime := autoreplyRandIntn(751) + 100
+	stSize := int64(math.Round((float64(autoreplyRandInt63())/float64(math.MaxInt64)*8 + 0.4) * float64(stTime)))
+	cuid := fmt.Sprintf("baidutiebaapp%08d", autoreplyRandIntn(90000000)+10000000)
 
 	params := map[string]string{
 		"_client_type":    "2",
@@ -892,27 +954,54 @@ func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[str
 	if err := dec.Decode(&result); err != nil {
 		return nil, err
 	}
+	// 检查贴吧 API 返回的业务错误码
+	if ec := weltolkToInt64(result["error_code"]); ec != 0 {
+		errMsg := weltolkToString(result["error_msg"])
+		if errMsg == "" {
+			errMsg = fmt.Sprintf("error_code=%d", ec)
+		}
+		return result, fmt.Errorf("tieba api error: %s", errMsg)
+	}
 	return result, nil
 }
 
-func weltolkGetReplyCount(tid int64, bduss string) (int64, bool) {
+func weltolkGetReplyCount(tid int64, bduss string) (replyCount int64, totalPage int, ok bool) {
 	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, "1", "1", "0")
 	if err != nil || resp == nil {
-		return 0, false
+		return 0, 0, false
 	}
-	thread, ok := resp["thread"].(map[string]any)
-	if !ok {
-		return 0, false
+	thread, hasThread := resp["thread"].(map[string]any)
+	if !hasThread {
+		return 0, 0, false
 	}
-	v, ok := thread["reply_num"]
-	if !ok {
-		return 0, false
+	v, hasReplyNum := thread["reply_num"]
+	if !hasReplyNum {
+		return 0, 0, false
 	}
-	return weltolkToInt64(v), true
+	replyCount = weltolkToInt64(v)
+	// 从 page 信息获取总页数（rn=1 时 total_page 即为帖子总数）
+	if page, ok := resp["page"].(map[string]any); ok {
+		totalPage = int(weltolkToInt64(page["total_page"]))
+	}
+	if totalPage < 1 {
+		totalPage = 1
+	}
+	return replyCount, totalPage, true
 }
 
-func weltolkGetLastFloorContent(tid int64, bduss string, limit int) []*weltolkFloor {
-	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, "1", strconv.Itoa(limit), "0")
+// weltolkGetLastFloorContent 获取帖子的最新楼层内容。
+// totalPostCount 为帖子总数（由 weltolkGetReplyCount 返回的 totalPage），
+// 用于计算最后一页的页码，确保获取的是最新楼层而非第一页的旧楼层。
+func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPostCount int) []*weltolkFloor {
+	// 根据帖子总数和每页大小计算最后一页的页码
+	pn := 1
+	if totalPostCount > 0 && limit > 0 {
+		pn = (totalPostCount + limit - 1) / limit
+		if pn < 1 {
+			pn = 1
+		}
+	}
+	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, strconv.Itoa(pn), strconv.Itoa(limit), "0")
 	if err != nil || resp == nil {
 		return nil
 	}
@@ -929,10 +1018,12 @@ func weltolkGetLastFloorContent(tid int64, bduss string, limit int) []*weltolkFl
 		}
 		authorID := weltolkToInt64(post["author_id"])
 		username := ""
+		portrait := ""
 		if authorID != 0 {
 			username = fmt.Sprintf("用户%d", authorID)
 		}
 		if author, ok := post["author"].(map[string]any); ok {
+			portrait = weltolkToString(author["portrait"])
 			if n := weltolkParseAuthorName(author, authorID); n != "" {
 				username = n
 			}
@@ -943,7 +1034,7 @@ func weltolkGetLastFloorContent(tid int64, bduss string, limit int) []*weltolkFl
 			AuthorID: authorID,
 			Floor:    weltolkToInt64(post["floor"]),
 			Username: username,
-			Portrait: "",
+			Portrait: portrait,
 			Content:  weltolkExtractTextContent(post["content"]),
 		}
 
@@ -987,16 +1078,6 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 
 	now := time.Now().Unix()
 	logTime := weltolkAutoreplyNowString(now)
-
-	// 全局冷却检查：任意两次回复之间至少等待 global_cooldown 秒
-	globalCooldown, _ := strconv.Atoi(_function.GetOption(weltolkAutoreplyGlobalCooldownKey))
-	if globalCooldown > 0 {
-		lastGlobalReply, _ := strconv.Atoi(_function.GetOption(weltolkAutoreplyLastGlobalReplyKey))
-		if lastGlobalReply > 0 && now-int64(lastGlobalReply) < int64(globalCooldown) {
-			slog.Debug("plugin.weltolk-autoreply.action.global-cooldown", "remaining", globalCooldown-int(now-int64(lastGlobalReply)))
-			return
-		}
-	}
 
 	// 按 UID 分组处理任务，每个用户独立高水位，避免互相影响
 	uidList := []string{}
@@ -1105,6 +1186,25 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		pid = bind.ID
 	}
 
+	// 回复间隔检查：使用 LastReplyTime + taskID 作为种子确保间隔稳定
+	// 避免每次 cron tick 重新随机导致间隔不断变化、任务可能永远无法执行
+	// 放在 API 调用之前，避免间隔未到时浪费贴吧 API 请求
+	intervalSeed := int64(task.LastReplyTime) + int64(taskID)
+	effectiveInterval := calcEffectiveInterval(task.ReplyIntervalMin, task.ReplyIntervalMax, task.ReplyInterval, intervalSeed)
+	if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(effectiveInterval) {
+		remaining := effectiveInterval - int32(now-int64(task.LastReplyTime))
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", fmt.Sprintf("间隔未到（%d秒后）", remaining), fmt.Sprintf("执行结果：跳过：回复间隔未到（本次需等待 %d 秒，当前间隔设置 %d-%d 秒）", remaining, task.ReplyIntervalMin, task.ReplyIntervalMax))
+		return
+	}
+
+	if task.ReplyProbability < 100 {
+		r := autoreplyRandIntn(100) + 1
+		if r > int(task.ReplyProbability) {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "概率未命中", "执行结果：跳过：概率未命中")
+			return
+		}
+	}
+
 	cookie := _function.GetCookie(pid, true)
 	if cookie == nil || cookie.Bduss == "" {
 		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "未获取到BDUSS", "执行结果：跳过：未获取到BDUSS")
@@ -1113,7 +1213,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 	bduss := cookie.Bduss
 	stoken := cookie.Stoken
 
-	replyCount, ok := weltolkGetReplyCount(task.Tid, bduss)
+	replyCount, totalPage, ok := weltolkGetReplyCount(task.Tid, bduss)
 	if !ok || replyCount < 0 {
 		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取回复数失败", "执行结果：跳过：获取回复数失败")
 		return
@@ -1131,7 +1231,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 	keywordMaxSeenPid := int64(0)
 
 	if triggerMode != "keyword" {
-		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1)
+		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1, totalPage)
 		latestPid := int64(0)
 		if len(latestFloors) > 0 {
 			latestPid = latestFloors[0].ID
@@ -1161,7 +1261,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		floorNum = ""
 		subPostID = ""
 
-		floors := weltolkGetLastFloorContent(task.Tid, bduss, 20)
+		floors := weltolkGetLastFloorContent(task.Tid, bduss, 20, totalPage)
 		if len(floors) == 0 {
 			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "获取楼层内容失败", "执行结果：跳过：获取楼层内容失败")
 			return
@@ -1246,22 +1346,6 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		}
 	}
 
-	// 随机回复间隔
-	effectiveInterval := calcEffectiveInterval(task.ReplyIntervalMin, task.ReplyIntervalMax, task.ReplyInterval)
-	if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(effectiveInterval) {
-		remaining := effectiveInterval - int32(now-int64(task.LastReplyTime))
-		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", fmt.Sprintf("间隔未到（%d秒后）", remaining), fmt.Sprintf("执行结果：跳过：回复间隔未到（本次需等待 %d 秒，当前间隔设置 %d-%d 秒）", remaining, task.ReplyIntervalMin, task.ReplyIntervalMax))
-		return
-	}
-
-	if task.ReplyProbability < 100 {
-		r := autoreplyRand.Intn(100) + 1
-		if r > int(task.ReplyProbability) {
-			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "概率未命中", "执行结果：跳过：概率未命中")
-			return
-		}
-	}
-
 	tbsResp, err := _function.GetTbs(bduss)
 	if err != nil || tbsResp == nil || tbsResp.Tbs == "" {
 		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取TBS失败", "执行结果：跳过：获取TBS失败")
@@ -1286,13 +1370,14 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 			}
 		}
 		if len(validLines) > 0 {
-			replyContent = validLines[autoreplyRand.Intn(len(validLines))]
+			replyContent = validLines[autoreplyRandIntn(len(validLines))]
 		}
 	}
 
-	floorForReplace := strconv.FormatInt(replyCount, 10)
-	if triggerMode == "keyword" && floorNum != "" {
-		floorForReplace = floorNum
+	// {floor} 变量替换为实际楼层号，两种模式统一使用 floorNum
+	floorForReplace := floorNum
+	if floorForReplace == "" {
+		floorForReplace = strconv.FormatInt(replyCount, 10)
 	}
 	finalContent := strings.NewReplacer(
 		"{floor}", floorForReplace,
@@ -1310,9 +1395,6 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 	result := autoreplyAddPost(bduss, stoken, tbs, task.Fname, fid, task.Tid, finalContent, showName, quoteID, replyUID, floorNum, subPostID)
 
 	if result.Success {
-		// 更新全局最后回复时间戳
-		_function.SetOption(weltolkAutoreplyLastGlobalReplyKey, int(now))
-
 		newLastRepliedPid := task.LastRepliedPid
 		if !allowReplied {
 			if triggerMode == "keyword" {
@@ -1837,11 +1919,17 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 	atUsername := ""
 	atPortrait := ""
 
+	// 获取帖子总数以计算最后一页（获取最新楼层）
+	_, totalPage, replyOk := weltolkGetReplyCount(binding.Tid, bduss)
+	if !replyOk {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "测试发帖失败：获取帖子信息失败", _function.EchoEmptyObject, "tbsign"))
+	}
+
 	if triggerMode == "keyword" {
 		if strings.TrimSpace(binding.MatchKeywords) == "" {
 			return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词模式但未设置关键词，将作为主题回复", _function.EchoEmptyObject, "tbsign"))
 		}
-		floors := weltolkGetLastFloorContent(binding.Tid, bduss, 20)
+		floors := weltolkGetLastFloorContent(binding.Tid, bduss, 20, totalPage)
 		if len(floors) == 0 {
 			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "获取楼层内容失败，无法测试关键词匹配", _function.EchoEmptyObject, "tbsign"))
 		}
@@ -1864,18 +1952,18 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 					atPortrait = floor.Portrait
 					replyUID = strconv.FormatInt(floor.AuthorID, 10)
 					if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
-						subMatched := false
 						for _, sp := range floor.SubPosts {
+							if strings.TrimSpace(sp.Content) == "" {
+								continue
+							}
 							if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
 								subPostID = strconv.FormatInt(sp.ID, 10)
 								replyUID = strconv.FormatInt(sp.AuthorID, 10)
 								atUsername = sp.Username
 								atPortrait = sp.Portrait
-								subMatched = true
 								break
 							}
 						}
-						_ = subMatched
 					}
 					goto testMatched
 				}
@@ -1886,7 +1974,7 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 			return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词未匹配任何楼层", _function.EchoEmptyObject, "tbsign"))
 		}
 	} else {
-		latestFloors := weltolkGetLastFloorContent(binding.Tid, bduss, 1)
+		latestFloors := weltolkGetLastFloorContent(binding.Tid, bduss, 1, totalPage)
 		if len(latestFloors) > 0 {
 			latest := latestFloors[0]
 			quoteID = strconv.FormatInt(latest.ID, 10)
@@ -1925,21 +2013,15 @@ func PluginWeltolkAutoReplySettings(c echo.Context) error {
 		global = "5"
 	}
 	personal := _function.GetUserOption(weltolkAutoreplyLimitKey, uid)
-	globalCooldown := _function.GetOption(weltolkAutoreplyGlobalCooldownKey)
-	if globalCooldown == "" {
-		globalCooldown = "0"
-	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]string{
-		"global_limit":     global,
-		"personal_limit":   personal,
-		"global_cooldown":  globalCooldown,
+		"global_limit":   global,
+		"personal_limit": personal,
 	}, "tbsign"))
 }
 
 type weltolkAutoReplySettingsUpdateBinding struct {
-	GlobalLimit    *int `json:"global_limit" form:"global_limit"`
-	PersonalLimit  *int `json:"personal_limit" form:"personal_limit"`
-	GlobalCooldown *int `json:"global_cooldown" form:"global_cooldown"`
+	GlobalLimit   *int `json:"global_limit" form:"global_limit"`
+	PersonalLimit *int `json:"personal_limit" form:"personal_limit"`
 }
 
 func PluginWeltolkAutoReplySettingsUpdate(c echo.Context) error {
@@ -1960,18 +2042,6 @@ func PluginWeltolkAutoReplySettingsUpdate(c echo.Context) error {
 			*binding.GlobalLimit = 1
 		}
 		if err := _function.SetOption(weltolkAutoreplyLimitKey, *binding.GlobalLimit); err != nil {
-			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
-		}
-	}
-
-	if binding.GlobalCooldown != nil {
-		if !isAdmin {
-			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无权修改全局冷却时间", _function.EchoEmptyObject, "tbsign"))
-		}
-		if *binding.GlobalCooldown < 0 {
-			*binding.GlobalCooldown = 0
-		}
-		if err := _function.SetOption(weltolkAutoreplyGlobalCooldownKey, *binding.GlobalCooldown); err != nil {
 			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
 		}
 	}
