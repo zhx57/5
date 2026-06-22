@@ -45,9 +45,11 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameFE:      "weltolk_autoreply",
 		Version:           "1.0",
 		Options: map[string]string{
-			"weltolk_autoreply_limit":        "5",
-			"weltolk_autoreply_id":           "0",
-			"weltolk_autoreply_action_limit": "50",
+			"weltolk_autoreply_limit":            "5",
+			"weltolk_autoreply_id":               "0",
+			"weltolk_autoreply_action_limit":     "50",
+			"weltolk_autoreply_global_cooldown":  "0",
+			"weltolk_autoreply_last_global_reply": "0",
 		},
 		SettingOptions: map[string]PluginSettingOption{
 			"weltolk_autoreply_limit": {
@@ -64,6 +66,13 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 					Min: _function.VPtr(int64(0)),
 				},
 			},
+			"weltolk_autoreply_global_cooldown": {
+				OptionName:   "weltolk_autoreply_global_cooldown",
+				OptionNameCN: "全局回复冷却时间（秒）",
+				Validate: &_function.OptionRule{
+					Min: _function.VPtr(int64(0)),
+				},
+			},
 		},
 		Endpoints: []PluginEndpointStruct{
 			{Method: http.MethodGet, Path: "switch", Function: PluginWeltolkAutoReplyGetSwitch},
@@ -72,6 +81,7 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 			{Method: http.MethodPatch, Path: "list", Function: PluginWeltolkAutoReplyListAdd},
 			{Method: http.MethodPut, Path: "list/:id", Function: PluginWeltolkAutoReplyListEdit},
 			{Method: http.MethodDelete, Path: "list/:id", Function: PluginWeltolkAutoReplyListDelete},
+			{Method: http.MethodPost, Path: "list/:id/toggle", Function: PluginWeltolkAutoReplyListToggle},
 			{Method: http.MethodPost, Path: "list/empty", Function: PluginWeltolkAutoReplyListEmpty},
 			{Method: http.MethodPost, Path: "test", Function: PluginWeltolkAutoReplyTest},
 			{Method: http.MethodGet, Path: "settings", Function: PluginWeltolkAutoReplySettings},
@@ -83,6 +93,8 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 const weltolkAutoreplyOpenKey = "weltolk_autoreply_open"
 const weltolkAutoreplyLimitKey = "weltolk_autoreply_limit"
 const weltolkAutoreplyHighWaterKey = "weltolk_autoreply_high_water"
+const weltolkAutoreplyGlobalCooldownKey = "weltolk_autoreply_global_cooldown"
+const weltolkAutoreplyLastGlobalReplyKey = "weltolk_autoreply_last_global_reply"
 
 // helpers
 
@@ -849,6 +861,16 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 	now := time.Now().Unix()
 	logTime := weltolkAutoreplyNowString(now)
 
+	// 全局冷却检查：任意两次回复之间至少等待 global_cooldown 秒
+	globalCooldown, _ := strconv.Atoi(_function.GetOption(weltolkAutoreplyGlobalCooldownKey))
+	if globalCooldown > 0 {
+		lastGlobalReply, _ := strconv.Atoi(_function.GetOption(weltolkAutoreplyLastGlobalReplyKey))
+		if lastGlobalReply > 0 && now-int64(lastGlobalReply) < int64(globalCooldown) {
+			slog.Debug("plugin.weltolk-autoreply.action.global-cooldown", "remaining", globalCooldown-int(now-int64(lastGlobalReply)))
+			return
+		}
+	}
+
 	highWater, _ := strconv.Atoi(_function.GetOption(weltolkAutoreplyHighWaterKey))
 	if highWater < 0 {
 		highWater = 0
@@ -869,17 +891,9 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 		}
 	}
 
-	// 应用每分钟最大执行数限制：随机挑选任务，与 PHP 版“随机一条回复”语义一致
-	actionLimitStr := _function.GetOption("weltolk_autoreply_action_limit")
-	actionLimit, _ := strconv.Atoi(actionLimitStr)
-	if actionLimit < 0 {
-		actionLimit = 0
-	}
-	if actionLimit > 0 && len(tasks) > actionLimit {
-		mrand.Shuffle(len(tasks), func(i, j int) {
-			tasks[i], tasks[j] = tasks[j], tasks[i]
-		})
-		tasks = tasks[:actionLimit]
+	// 顺序执行：每分钟只执行1个任务，避免短时间内大量回复
+	if len(tasks) > 0 {
+		tasks = tasks[:1]
 	}
 
 	for _, task := range tasks {
@@ -893,7 +907,7 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 
 		slog.Debug("plugin.weltolk-autoreply.action.task", "id", taskID, "fname", task.Fname, "tid", task.Tid)
 
-		if strings.TrimSpace(task.ReplyContent) == "" {
+		if strings.TrimSpace(task.ReplyContent) == "" && strings.TrimSpace(task.ReplyContentList) == "" {
 			slog.Debug("plugin.weltolk-autoreply.action.skip-empty", "id", taskID)
 			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
 				"pid":             task.Pid,
@@ -902,6 +916,44 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 				"last_check_time": now,
 			})
 			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：回复内容为空<br>", logTime))
+			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
+			continue
+		}
+
+		// 活跃时间窗口检查
+		if task.ActiveTimeStart != "" && task.ActiveTimeEnd != "" {
+			nowTime := time.Now().Format("15:04")
+			inWindow := false
+			if task.ActiveTimeStart <= task.ActiveTimeEnd {
+				// 正常时间段，如 08:00-22:00
+				inWindow = nowTime >= task.ActiveTimeStart && nowTime < task.ActiveTimeEnd
+			} else {
+				// 跨午夜时间段，如 22:00-08:00
+				inWindow = nowTime >= task.ActiveTimeStart || nowTime < task.ActiveTimeEnd
+			}
+			if !inWindow {
+				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+					"pid":             task.Pid,
+					"last_status":     "skipped",
+					"last_error":      "不在活跃时间段内",
+					"last_check_time": now,
+				})
+				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：不在活跃时间段内（%s-%s）<br>", logTime, task.ActiveTimeStart, task.ActiveTimeEnd))
+				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
+				continue
+			}
+		}
+
+		// 执行次数限制检查
+		if task.MaxCount > 0 && task.SuccessCount >= task.MaxCount {
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+				"pid":             task.Pid,
+				"enabled":         0,
+				"last_status":     "completed",
+				"last_error":      "已达到最大执行次数",
+				"last_check_time": now,
+			})
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：已达到最大执行次数（%d/%d），任务已自动禁用<br>", logTime, task.SuccessCount, task.MaxCount))
 			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
 			continue
 		}
@@ -1115,8 +1167,16 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 			}
 		}
 
-		if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(task.ReplyInterval) {
-			remaining := task.ReplyInterval - int32(now-int64(task.LastReplyTime))
+		// 随机回复间隔
+		effectiveInterval := task.ReplyIntervalMin
+		if effectiveInterval <= 0 {
+			effectiveInterval = task.ReplyInterval // fallback to old field
+		}
+		if task.ReplyIntervalMax > task.ReplyIntervalMin {
+			effectiveInterval = task.ReplyIntervalMin + int32(mrand.Intn(int(task.ReplyIntervalMax-task.ReplyIntervalMin)+1))
+		}
+		if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(effectiveInterval) {
+			remaining := effectiveInterval - int32(now-int64(task.LastReplyTime))
 			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
 				"pid":             pid,
 				"last_status":     "skipped",
@@ -1170,6 +1230,21 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 			continue
 		}
 
+		// 随机选择回复内容
+		replyContent := task.ReplyContent
+		if task.ReplyContentList != "" {
+			lines := strings.Split(task.ReplyContentList, "\n")
+			var validLines []string
+			for _, line := range lines {
+				if strings.TrimSpace(line) != "" {
+					validLines = append(validLines, line)
+				}
+			}
+			if len(validLines) > 0 {
+				replyContent = validLines[mrand.Intn(len(validLines))]
+			}
+		}
+
 		floorForReplace := strconv.FormatInt(replyCount, 10)
 		if triggerMode == "keyword" && floorNum != "" {
 			floorForReplace = floorNum
@@ -1180,7 +1255,7 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 			"{date}", time.Unix(now, 0).Format("2006-01-02"),
 			"{tid}", strconv.FormatInt(task.Tid, 10),
 			"{username}", atUsername,
-		).Replace(task.ReplyContent)
+		).Replace(replyContent)
 
 		if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
 			finalContent = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, finalContent)
@@ -1190,6 +1265,9 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 		result := autoreplyAddPost(bduss, stoken, tbs, task.Fname, fid, task.Tid, finalContent, showName, quoteID, replyUID, floorNum, subPostID)
 
 		if result.Success {
+			// 更新全局最后回复时间戳
+			_function.SetOption(weltolkAutoreplyLastGlobalReplyKey, int(now))
+
 			newLastRepliedPid := task.LastRepliedPid
 			if !allowReplied {
 				if triggerMode == "keyword" {
@@ -1207,8 +1285,19 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 				"last_status":      "ok",
 				"last_error":       "",
 				"last_check_time":  now,
+				"success_count":    gorm.Expr("success_count + 1"),
 			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作成功<br>", logTime))
+			// Check if max count reached after incrementing
+			if task.MaxCount > 0 && task.SuccessCount+1 >= task.MaxCount {
+				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+					"enabled":     0,
+					"last_status": "completed",
+					"last_error":  "已达到最大执行次数",
+				})
+				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：成功（已达到最大执行次数 %d/%d，任务已自动禁用）<br>", logTime, task.SuccessCount+1, task.MaxCount))
+			} else {
+				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作成功<br>", logTime))
+			}
 		} else if result.NeedVcode {
 			vcodePid := task.LastRepliedPid
 			if !allowReplied {
@@ -1405,13 +1494,19 @@ type weltolkAutoReplyListAddBinding struct {
 	Fname            string `json:"fname" form:"fname"`
 	Tid              int64  `json:"tid" form:"tid"`
 	ReplyContent     string `json:"reply_content" form:"reply_content"`
+	ReplyContentList string `json:"reply_content_list" form:"reply_content_list"`
 	ReplyInterval    int32  `json:"reply_interval" form:"reply_interval"`
+	ReplyIntervalMin int32  `json:"reply_interval_min" form:"reply_interval_min"`
+	ReplyIntervalMax int32  `json:"reply_interval_max" form:"reply_interval_max"`
 	ReplyProbability int32  `json:"reply_probability" form:"reply_probability"`
 	TriggerMode      string `json:"trigger_mode" form:"trigger_mode"`
 	ReplyTarget      string `json:"reply_target" form:"reply_target"`
 	AllowReplied     int32  `json:"allow_replied" form:"allow_replied"`
 	MatchKeywords    string `json:"match_keywords" form:"match_keywords"`
 	Enabled          int32  `json:"enabled" form:"enabled"`
+	MaxCount         int32  `json:"max_count" form:"max_count"`
+	ActiveTimeStart  string `json:"active_time_start" form:"active_time_start"`
+	ActiveTimeEnd    string `json:"active_time_end" form:"active_time_end"`
 }
 
 func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
@@ -1427,7 +1522,7 @@ func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "越权操作：该百度账号不属于您", _function.EchoEmptyObject, "tbsign"))
 	}
 
-	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || strings.TrimSpace(binding.ReplyContent) == "" {
+	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || (strings.TrimSpace(binding.ReplyContent) == "" && strings.TrimSpace(binding.ReplyContentList) == "") {
 		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
 	}
 
@@ -1440,6 +1535,15 @@ func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 
 	if binding.ReplyInterval <= 0 {
 		binding.ReplyInterval = 300
+	}
+	if binding.ReplyIntervalMin <= 0 {
+		binding.ReplyIntervalMin = binding.ReplyInterval // fallback
+		if binding.ReplyIntervalMin <= 0 {
+			binding.ReplyIntervalMin = 300
+		}
+	}
+	if binding.ReplyIntervalMax < binding.ReplyIntervalMin {
+		binding.ReplyIntervalMax = 0
 	}
 	if binding.ReplyProbability <= 0 || binding.ReplyProbability > 100 {
 		binding.ReplyProbability = 100
@@ -1460,13 +1564,19 @@ func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 		Fname:            strings.TrimSpace(binding.Fname),
 		Tid:              binding.Tid,
 		ReplyContent:     binding.ReplyContent,
-		ReplyInterval:    binding.ReplyInterval,
+		ReplyContentList: binding.ReplyContentList,
+		ReplyInterval:    binding.ReplyIntervalMin,
+		ReplyIntervalMin: binding.ReplyIntervalMin,
+		ReplyIntervalMax: binding.ReplyIntervalMax,
 		ReplyProbability: binding.ReplyProbability,
 		Enabled:          binding.Enabled,
 		TriggerMode:      binding.TriggerMode,
 		ReplyTarget:      binding.ReplyTarget,
 		AllowReplied:     binding.AllowReplied,
 		MatchKeywords:    binding.MatchKeywords,
+		MaxCount:         binding.MaxCount,
+		ActiveTimeStart:  binding.ActiveTimeStart,
+		ActiveTimeEnd:    binding.ActiveTimeEnd,
 	}
 	if err := _function.GormDB.W.Create(task).Error; err != nil {
 		slog.Error("plugin.weltolk-autoreply.list.add", "uid", uid, "error", err)
@@ -1503,12 +1613,21 @@ func PluginWeltolkAutoReplyListEdit(c echo.Context) error {
 		}
 	}
 
-	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || strings.TrimSpace(binding.ReplyContent) == "" {
+	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || (strings.TrimSpace(binding.ReplyContent) == "" && strings.TrimSpace(binding.ReplyContentList) == "") {
 		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
 	}
 
 	if binding.ReplyInterval <= 0 {
 		binding.ReplyInterval = 300
+	}
+	if binding.ReplyIntervalMin <= 0 {
+		binding.ReplyIntervalMin = binding.ReplyInterval // fallback
+		if binding.ReplyIntervalMin <= 0 {
+			binding.ReplyIntervalMin = 300
+		}
+	}
+	if binding.ReplyIntervalMax < binding.ReplyIntervalMin {
+		binding.ReplyIntervalMax = 0
 	}
 	if binding.ReplyProbability <= 0 || binding.ReplyProbability > 100 {
 		binding.ReplyProbability = 100
@@ -1524,16 +1643,22 @@ func PluginWeltolkAutoReplyListEdit(c echo.Context) error {
 	}
 
 	updates := map[string]any{
-		"fname":             strings.TrimSpace(binding.Fname),
-		"tid":               binding.Tid,
-		"reply_content":     binding.ReplyContent,
-		"reply_interval":    binding.ReplyInterval,
-		"reply_probability": binding.ReplyProbability,
-		"trigger_mode":      binding.TriggerMode,
-		"reply_target":      binding.ReplyTarget,
-		"allow_replied":     binding.AllowReplied,
-		"match_keywords":    binding.MatchKeywords,
-		"enabled":           binding.Enabled,
+		"fname":               strings.TrimSpace(binding.Fname),
+		"tid":                 binding.Tid,
+		"reply_content":       binding.ReplyContent,
+		"reply_content_list":  binding.ReplyContentList,
+		"reply_interval":      binding.ReplyIntervalMin,
+		"reply_interval_min":  binding.ReplyIntervalMin,
+		"reply_interval_max":  binding.ReplyIntervalMax,
+		"reply_probability":   binding.ReplyProbability,
+		"trigger_mode":        binding.TriggerMode,
+		"reply_target":        binding.ReplyTarget,
+		"allow_replied":       binding.AllowReplied,
+		"match_keywords":      binding.MatchKeywords,
+		"enabled":             binding.Enabled,
+		"max_count":           binding.MaxCount,
+		"active_time_start":   binding.ActiveTimeStart,
+		"active_time_end":     binding.ActiveTimeEnd,
 	}
 	if binding.Pid > 0 {
 		updates["pid"] = binding.Pid
@@ -1567,6 +1692,34 @@ func PluginWeltolkAutoReplyListDelete(c echo.Context) error {
 		slog.Error("plugin.weltolk-autoreply.list.delete", "uid", uid, "id", id, "error", err)
 		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
 	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyListToggle(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	var task model.TcWeltolkAutoreplyTasks
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Take(&task).Error; err != nil {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "任务不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	newEnabled := int32(1)
+	if task.Enabled == 1 {
+		newEnabled = 0
+	}
+
+	if err := _function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Updates(map[string]any{
+		"enabled": newEnabled,
+	}).Error; err != nil {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	task.Enabled = newEnabled
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
 }
 
@@ -1728,15 +1881,21 @@ func PluginWeltolkAutoReplySettings(c echo.Context) error {
 		global = "5"
 	}
 	personal := _function.GetUserOption(weltolkAutoreplyLimitKey, uid)
+	globalCooldown := _function.GetOption(weltolkAutoreplyGlobalCooldownKey)
+	if globalCooldown == "" {
+		globalCooldown = "0"
+	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]string{
-		"global_limit":    global,
-		"personal_limit":  personal,
+		"global_limit":     global,
+		"personal_limit":   personal,
+		"global_cooldown":  globalCooldown,
 	}, "tbsign"))
 }
 
 type weltolkAutoReplySettingsUpdateBinding struct {
 	GlobalLimit    *int `json:"global_limit" form:"global_limit"`
 	PersonalLimit  *int `json:"personal_limit" form:"personal_limit"`
+	GlobalCooldown *int `json:"global_cooldown" form:"global_cooldown"`
 }
 
 func PluginWeltolkAutoReplySettingsUpdate(c echo.Context) error {
@@ -1757,6 +1916,18 @@ func PluginWeltolkAutoReplySettingsUpdate(c echo.Context) error {
 			*binding.GlobalLimit = 1
 		}
 		if err := _function.SetOption(weltolkAutoreplyLimitKey, *binding.GlobalLimit); err != nil {
+			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
+		}
+	}
+
+	if binding.GlobalCooldown != nil {
+		if !isAdmin {
+			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无权修改全局冷却时间", _function.EchoEmptyObject, "tbsign"))
+		}
+		if *binding.GlobalCooldown < 0 {
+			*binding.GlobalCooldown = 0
+		}
+		if err := _function.SetOption(weltolkAutoreplyGlobalCooldownKey, *binding.GlobalCooldown); err != nil {
 			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
 		}
 	}

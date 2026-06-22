@@ -28,7 +28,14 @@ type TcWeltolkAutoreplyTasks struct {
 	TriggerMode    string `gorm:"column:trigger_mode;type:varchar(20);not null;default:'new_floor'" json:"trigger_mode"`
 	ReplyTarget    string `gorm:"column:reply_target;type:varchar(20);not null;default:'floor'" json:"reply_target"`
 	AllowReplied   int32  `gorm:"column:allow_replied;type:tinyint;not null;default:0" json:"allow_replied"`
-	MatchKeywords  string `gorm:"column:match_keywords;type:text" json:"match_keywords"`
+	MatchKeywords    string `gorm:"column:match_keywords;type:text" json:"match_keywords"`
+	ReplyContentList string `gorm:"column:reply_content_list;type:text" json:"reply_content_list"`
+	ReplyIntervalMin int32  `gorm:"column:reply_interval_min;type:int;not null;default:300" json:"reply_interval_min"`
+	ReplyIntervalMax int32  `gorm:"column:reply_interval_max;type:int;not null;default:0" json:"reply_interval_max"`
+	MaxCount         int32  `gorm:"column:max_count;type:int;not null;default:0" json:"max_count"`
+	ActiveTimeStart  string `gorm:"column:active_time_start;type:varchar(5);default:''" json:"active_time_start"`
+	ActiveTimeEnd    string `gorm:"column:active_time_end;type:varchar(5);default:''" json:"active_time_end"`
+	SuccessCount     int32  `gorm:"column:success_count;type:int;not null;default:0" json:"success_count"`
 }
 
 // TableName TcWeltolkAutoreplyTasks's table name
