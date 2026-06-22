@@ -3,6 +3,7 @@ package _plugin
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"math"
 	"math/big"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -36,6 +38,9 @@ func init() {
 type WeltolkAutoReplyPluginType struct {
 	PluginInfo
 }
+
+// autoreplyRand 是插件独立的随机数生成器，避免并发使用全局 math/rand
+var autoreplyRand = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 
 var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 	PluginInfo{
@@ -110,6 +115,35 @@ func weltolkAutoreplyGetUserLimit(uid string) int {
 	return 5
 }
 
+// calcEffectiveInterval 计算实际回复间隔
+// 规则：min>0 && max>=min -> [min, max]
+//      min>0 && max<min  -> min（按min固定）
+//      min<=0 && max>0   -> [60, max]，避免0导致疯狂回复
+//      min<=0 && max<=0  -> 使用旧的 reply_interval 字段，若仍<=0则默认60
+func calcEffectiveInterval(replyIntervalMin, replyIntervalMax, replyInterval int32) int32 {
+	min := replyIntervalMin
+	max := replyIntervalMax
+
+	if min > 0 && max >= min {
+		return min + int32(autoreplyRand.Intn(int(max-min)+1))
+	}
+	if min > 0 {
+		return min
+	}
+	if max > 0 {
+		// 只设置了最大值，给一个合理下限避免过频
+		lower := int32(60)
+		if max < lower {
+			lower = max
+		}
+		return lower + int32(autoreplyRand.Intn(int(max-lower)+1))
+	}
+	if replyInterval > 0 {
+		return replyInterval
+	}
+	return 60
+}
+
 func weltolkAutoreplyAppendLog(taskID int32, entry string) {
 	var task model.TcWeltolkAutoreplyTasks
 	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Select("log").Take(&task).Error; err != nil {
@@ -126,6 +160,17 @@ func weltolkAutoreplyAppendLog(taskID int32, entry string) {
 
 func weltolkAutoreplyNowString(now int64) string {
 	return time.Unix(now, 0).Format("2006-01-02 15:04:05")
+}
+
+func weltolkAutoreplySkipTask(taskID int32, pid int32, now int64, logTime, highWaterKey, status, lastError, logMsg string) {
+	_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+		"pid":             pid,
+		"last_status":     status,
+		"last_error":      lastError,
+		"last_check_time": now,
+	})
+	weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] %s<br>", logTime, logMsg))
+	_function.SetOption(highWaterKey, int(taskID)+1)
 }
 
 // protobuf helpers
@@ -529,6 +574,56 @@ type autoreplyAddPostResult struct {
 	NeedVcode bool   `json:"need_vcode"`
 }
 
+func autoreplyIsTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(context.Context) (*http.Response, error)) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * 500 * time.Millisecond
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, ctx.Err()
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		resp, err := do(attemptCtx)
+		cancel()
+		if err == nil {
+			if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+				lastErr = fmt.Errorf("server returned status %d", resp.StatusCode)
+				resp.Body.Close()
+				continue
+			}
+			return resp, nil
+		}
+		lastErr = err
+		if !autoreplyIsTimeout(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
 func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) autoreplyAddPostResult {
 	protoBinary := autoreplyBuildPostProto(bduss, stoken, tbs, fname, fid, tid, content, showName, quoteID, replyUID, floorNum, subPostID)
 
@@ -539,23 +634,29 @@ func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content,
 	body.Write(protoBinary)
 	body.WriteString("\r\n--" + boundary + "--\r\n")
 
-	url := "https://tiebac.baidu.com/c/c/post/add?cmd=309731"
-	req, err := http.NewRequest(http.MethodPost, url, &body)
-	if err != nil {
-		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "Request Error: " + err.Error()}
-	}
-	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
-	req.Header.Set("User-Agent", "tieba/12.35.1.0")
-	req.Header.Set("x_bd_data_type", "protobuf")
-	req.Header.Set("Accept-Encoding", "gzip")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Cookie", "BDUSS="+bduss+"; STOKEN="+stoken+";")
+	targetURL := "https://tiebac.baidu.com/c/c/post/add?cmd=309731"
+	ctx := context.Background()
 
-	client := &http.Client{
-		Timeout:   60 * time.Second,
-		Transport: _function.TBClient.Transport,
+	do := func(reqCtx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(body.Bytes()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+		req.Header.Set("User-Agent", "tieba/12.35.1.0")
+		req.Header.Set("x_bd_data_type", "protobuf")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Cookie", "BDUSS="+bduss+"; STOKEN="+stoken+";")
+
+		client := &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: _function.TBClient.Transport,
+		}
+		return client.Do(req)
 	}
-	resp, err := client.Do(req)
+
+	resp, err := autoreplyDoWithRetry(ctx, 60*time.Second, do)
 	if err != nil {
 		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "CURL Error: " + err.Error()}
 	}
@@ -702,9 +803,9 @@ func weltolkParseAuthorName(author any, authorID int64) string {
 
 func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[string]any, error) {
 	secret := "tiebaclient!!!"
-	stTime := mrand.Intn(751) + 100
-	stSize := int64(math.Round((float64(mrand.Int63())/float64(math.MaxInt64)*8 + 0.4) * float64(stTime)))
-	cuid := fmt.Sprintf("baidutiebaapp%08d", mrand.Intn(90000000)+10000000)
+	stTime := autoreplyRand.Intn(751) + 100
+	stSize := int64(math.Round((float64(autoreplyRand.Int63())/float64(math.MaxInt64)*8 + 0.4) * float64(stTime)))
+	cuid := fmt.Sprintf("baidutiebaapp%08d", autoreplyRand.Intn(90000000)+10000000)
 
 	params := map[string]string{
 		"_client_type":    "2",
@@ -752,20 +853,41 @@ func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[str
 		"Cookie":     "ka=open; BDUSS=" + url.QueryEscape(bduss),
 	}
 
-	client := &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: _function.TBClient.Transport,
+	ctx := context.Background()
+	targetURL := "http://c.tieba.baidu.com/c/f/pb/page"
+
+	do := func(reqCtx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, strings.NewReader(body.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", headers["User-Agent"])
+		req.Header.Set("Cookie", headers["Cookie"])
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		client := &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: _function.TBClient.Transport,
+		}
+		return client.Do(req)
 	}
-	resp, err := _function.Fetch("http://c.tieba.baidu.com/c/f/pb/page", http.MethodPost, []byte(body.Encode()), headers, client)
+
+	resp, err := autoreplyDoWithRetry(ctx, 15*time.Second, do)
 	if err != nil {
 		return nil, err
 	}
-	if len(resp) == 0 {
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if len(respBody) == 0 {
 		return nil, errors.New("empty response")
 	}
 
 	var result map[string]any
-	dec := json.NewDecoder(bytes.NewReader(resp))
+	dec := json.NewDecoder(bytes.NewReader(respBody))
 	dec.UseNumber()
 	if err := dec.Decode(&result); err != nil {
 		return nil, err
@@ -876,491 +998,399 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 		}
 	}
 
-	highWater, _ := strconv.Atoi(_function.GetOption(weltolkAutoreplyHighWaterKey))
+	// 按 UID 分组处理任务，每个用户独立高水位，避免互相影响
+	uidList := []string{}
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ?", 1).Distinct("uid").Pluck("uid", &uidList).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.action.uid-list", "error", err)
+		return
+	}
+
+	for _, uid := range uidList {
+		weltolkAutoreplyProcessUser(uid, now, logTime)
+	}
+}
+
+func weltolkAutoreplyProcessUser(uid string, now int64, logTime string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("plugin.weltolk-autoreply.action.panic", "uid", uid, "recover", r)
+		}
+	}()
+
+	highWaterKey := weltolkAutoreplyHighWaterKey + "_" + uid
+	highWater, _ := strconv.Atoi(_function.GetOption(highWaterKey))
 	if highWater < 0 {
 		highWater = 0
 	}
 
 	var tasks []*model.TcWeltolkAutoreplyTasks
-	err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ? AND id >= ?", 1, highWater).Order("id ASC").Find(&tasks).Error
+	err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ? AND uid = ? AND id >= ?", 1, uid, highWater).Order("id ASC").Find(&tasks).Error
 	if err != nil {
-		slog.Error("plugin.weltolk-autoreply.action.query", "error", err)
+		slog.Error("plugin.weltolk-autoreply.action.query", "uid", uid, "error", err)
 		return
 	}
 	if len(tasks) == 0 {
-		_function.SetOption(weltolkAutoreplyHighWaterKey, 0)
-		err = _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ?", 1).Order("id ASC").Find(&tasks).Error
+		_function.SetOption(highWaterKey, 0)
+		err = _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ? AND uid = ?", 1, uid).Order("id ASC").Find(&tasks).Error
 		if err != nil {
-			slog.Error("plugin.weltolk-autoreply.action.query2", "error", err)
+			slog.Error("plugin.weltolk-autoreply.action.query2", "uid", uid, "error", err)
 			return
 		}
 	}
 
-	// 顺序执行：每分钟只执行1个任务，避免短时间内大量回复
-	// 跳过的任务不推进高水位，只有真正执行了的任务才推进
-	executed := false
-
+	// 顺序执行：每个用户每分钟只执行1个任务，避免短时间内大量回复
+	// 跳过的任务推进水位，执行了的任务推进水位并结束
 	for _, task := range tasks {
-		// 每分钟只执行1个任务，已执行的跳出循环
-		if executed {
-			break
+		weltolkAutoreplyProcessTask(task, now, logTime, highWaterKey)
+		// 每个用户每轮只真正执行1个任务（内部会break）
+		break
+	}
+}
+
+func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64, logTime, highWaterKey string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("plugin.weltolk-autoreply.task.panic", "id", task.ID, "recover", r)
+			_function.SetOption(highWaterKey, int(task.ID)+1)
+		}
+	}()
+
+	atUsername := ""
+	atPortrait := ""
+	quoteID := ""
+	replyUID := ""
+	floorNum := ""
+	subPostID := ""
+	taskID := task.ID
+
+	slog.Debug("plugin.weltolk-autoreply.action.task", "id", taskID, "fname", task.Fname, "tid", task.Tid)
+
+	if strings.TrimSpace(task.ReplyContent) == "" && strings.TrimSpace(task.ReplyContentList) == "" {
+		slog.Debug("plugin.weltolk-autoreply.action.skip-empty", "id", taskID)
+		weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "skipped", "回复内容为空", "执行结果：跳过：回复内容为空")
+		return
+	}
+
+	// 活跃时间窗口检查
+	if task.ActiveTimeStart != "" && task.ActiveTimeEnd != "" {
+		nowTime := time.Now().Format("15:04")
+		inWindow := false
+		if task.ActiveTimeStart <= task.ActiveTimeEnd {
+			inWindow = nowTime >= task.ActiveTimeStart && nowTime < task.ActiveTimeEnd
+		} else {
+			inWindow = nowTime >= task.ActiveTimeStart || nowTime < task.ActiveTimeEnd
+		}
+		if !inWindow {
+			weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "skipped", "不在活跃时间段内", fmt.Sprintf("执行结果：跳过：不在活跃时间段内（%s-%s）", task.ActiveTimeStart, task.ActiveTimeEnd))
+			return
+		}
+	}
+
+	// 执行次数限制检查
+	if task.MaxCount > 0 && task.SuccessCount >= task.MaxCount {
+		weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "completed", "已达到最大执行次数", fmt.Sprintf("执行结果：已达到最大执行次数（%d/%d），任务已自动禁用", task.SuccessCount, task.MaxCount))
+		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Update("enabled", 0)
+		return
+	}
+
+	// 使用任务保存时指定的百度账号 pid，避免小号被覆盖成大号
+	pid := task.Pid
+	if pid <= 0 {
+		var bind model.TcBaiduid
+		if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", task.UID).Order("id ASC").Take(&bind).Error; err != nil {
+			slog.Debug("plugin.weltolk-autoreply.action.no-bind", "id", taskID, "uid", task.UID, "error", err)
+			weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "error", "未找到贴吧绑定信息", "执行结果：跳过：未找到贴吧绑定信息")
+			return
+		}
+		pid = bind.ID
+	}
+
+	cookie := _function.GetCookie(pid, true)
+	if cookie == nil || cookie.Bduss == "" {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "未获取到BDUSS", "执行结果：跳过：未获取到BDUSS")
+		return
+	}
+	bduss := cookie.Bduss
+	stoken := cookie.Stoken
+
+	replyCount, ok := weltolkGetReplyCount(task.Tid, bduss)
+	if !ok || replyCount < 0 {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取回复数失败", "执行结果：跳过：获取回复数失败")
+		return
+	}
+
+	triggerMode := task.TriggerMode
+	if triggerMode == "" {
+		triggerMode = "new_floor"
+	}
+	replyTarget := task.ReplyTarget
+	if replyTarget == "" {
+		replyTarget = "floor"
+	}
+	allowReplied := task.AllowReplied == 1
+	keywordMaxSeenPid := int64(0)
+
+	if triggerMode != "keyword" {
+		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1)
+		latestPid := int64(0)
+		if len(latestFloors) > 0 {
+			latestPid = latestFloors[0].ID
+		}
+		if !allowReplied && latestPid <= task.LastRepliedPid {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "没有新楼层", "执行结果：跳过：没有新楼层")
+			return
+		}
+		if len(latestFloors) == 0 {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取楼层内容失败", "执行结果：跳过：获取楼层内容失败")
+			return
+		}
+		latest := latestFloors[0]
+		quoteID = strconv.FormatInt(latest.ID, 10)
+		replyUID = strconv.FormatInt(latest.AuthorID, 10)
+		floorNum = strconv.FormatInt(latest.Floor, 10)
+		atUsername = latest.Username
+		atPortrait = latest.Portrait
+		subPostID = ""
+	}
+
+	if triggerMode == "keyword" {
+		atUsername = ""
+		atPortrait = ""
+		quoteID = ""
+		replyUID = ""
+		floorNum = ""
+		subPostID = ""
+
+		floors := weltolkGetLastFloorContent(task.Tid, bduss, 20)
+		if len(floors) == 0 {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "获取楼层内容失败", "执行结果：跳过：获取楼层内容失败")
+			return
 		}
 
-		atUsername := ""
-		atPortrait := ""
-		quoteID := ""
-		replyUID := ""
-		floorNum := ""
-		subPostID := ""
-		taskID := task.ID
-
-		slog.Debug("plugin.weltolk-autoreply.action.task", "id", taskID, "fname", task.Fname, "tid", task.Tid)
-
-		if strings.TrimSpace(task.ReplyContent) == "" && strings.TrimSpace(task.ReplyContentList) == "" {
-			slog.Debug("plugin.weltolk-autoreply.action.skip-empty", "id", taskID)
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             task.Pid,
-				"last_status":     "skipped",
-				"last_error":      "",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：回复内容为空<br>", logTime))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-
-		// 活跃时间窗口检查
-		if task.ActiveTimeStart != "" && task.ActiveTimeEnd != "" {
-			nowTime := time.Now().Format("15:04")
-			inWindow := false
-			if task.ActiveTimeStart <= task.ActiveTimeEnd {
-				inWindow = nowTime >= task.ActiveTimeStart && nowTime < task.ActiveTimeEnd
-			} else {
-				inWindow = nowTime >= task.ActiveTimeStart || nowTime < task.ActiveTimeEnd
+		for _, floor := range floors {
+			if floor.ID > keywordMaxSeenPid {
+				keywordMaxSeenPid = floor.ID
 			}
-			if !inWindow {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             task.Pid,
-					"last_status":     "skipped",
-					"last_error":      "不在活跃时间段内",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：不在活跃时间段内（%s-%s）<br>", logTime, task.ActiveTimeStart, task.ActiveTimeEnd))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
+		}
+
+		var newFloors []*weltolkFloor
+		for _, floor := range floors {
+			if allowReplied || floor.ID > task.LastRepliedPid {
+				newFloors = append(newFloors, floor)
+			}
+		}
+		if len(newFloors) == 0 {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "无新楼层", "执行结果：跳过：无新楼层")
+			return
+		}
+
+		matched := false
+		keywords := strings.Split(task.MatchKeywords, "\n")
+		for _, floor := range newFloors {
+			if strings.TrimSpace(floor.Content) == "" {
 				continue
 			}
-		}
-
-		// 执行次数限制检查
-		if task.MaxCount > 0 && task.SuccessCount >= task.MaxCount {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             task.Pid,
-				"enabled":         0,
-				"last_status":     "completed",
-				"last_error":      "已达到最大执行次数",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：已达到最大执行次数（%d/%d），任务已自动禁用<br>", logTime, task.SuccessCount, task.MaxCount))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-
-		// 使用任务保存时指定的百度账号 pid，避免小号被覆盖成大号
-		pid := task.Pid
-		if pid <= 0 {
-			var bind model.TcBaiduid
-			if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", task.UID).Order("id ASC").Take(&bind).Error; err != nil {
-				slog.Debug("plugin.weltolk-autoreply.action.no-bind", "id", taskID, "uid", task.UID, "error", err)
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             task.Pid,
-					"last_status":     "error",
-					"last_error":      "未找到贴吧绑定信息",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：未找到贴吧绑定信息<br>", logTime))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
-			pid = bind.ID
-		}
-
-		cookie := _function.GetCookie(pid, true)
-		if cookie == nil || cookie.Bduss == "" {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             pid,
-				"last_status":     "error",
-				"last_error":      "未获取到BDUSS",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：未获取到BDUSS<br>", logTime))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-		bduss := cookie.Bduss
-		stoken := cookie.Stoken
-
-		replyCount, ok := weltolkGetReplyCount(task.Tid, bduss)
-		if !ok || replyCount < 0 {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             pid,
-				"last_status":     "error",
-				"last_error":      "获取回复数失败",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：获取回复数失败<br>", logTime))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-
-		triggerMode := task.TriggerMode
-		if triggerMode == "" {
-			triggerMode = "new_floor"
-		}
-		replyTarget := task.ReplyTarget
-		if replyTarget == "" {
-			replyTarget = "floor"
-		}
-		allowReplied := task.AllowReplied == 1
-		keywordMaxSeenPid := int64(0)
-
-		if triggerMode != "keyword" {
-			latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1)
-			latestPid := int64(0)
-			if len(latestFloors) > 0 {
-				latestPid = latestFloors[0].ID
-			}
-			if !allowReplied && latestPid <= task.LastRepliedPid {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_status":     "skipped",
-					"last_error":      "",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：没有新楼层<br>", logTime))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
-			if len(latestFloors) == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_status":     "error",
-					"last_error":      "获取楼层内容失败",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：获取楼层内容失败<br>", logTime))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
-			latest := latestFloors[0]
-			quoteID = strconv.FormatInt(latest.ID, 10)
-			replyUID = strconv.FormatInt(latest.AuthorID, 10)
-			floorNum = strconv.FormatInt(latest.Floor, 10)
-			atUsername = latest.Username
-			atPortrait = latest.Portrait
-			subPostID = ""
-		}
-
-		if triggerMode == "keyword" {
-			atUsername = ""
-			atPortrait = ""
-			quoteID = ""
-			replyUID = ""
-			floorNum = ""
-			subPostID = ""
-
-			floors := weltolkGetLastFloorContent(task.Tid, bduss, 20)
-			if len(floors) == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_status":     "skipped",
-					"last_error":      "获取楼层内容失败",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：获取楼层内容失败<br>", logTime))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
-
-			for _, floor := range floors {
-				if floor.ID > keywordMaxSeenPid {
-					keywordMaxSeenPid = floor.ID
-				}
-			}
-
-			var newFloors []*weltolkFloor
-			for _, floor := range floors {
-				if allowReplied || floor.ID > task.LastRepliedPid {
-					newFloors = append(newFloors, floor)
-				}
-			}
-			if len(newFloors) == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_status":     "skipped",
-					"last_error":      "",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：无新楼层<br>", logTime))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
-
-			matched := false
-			keywords := strings.Split(task.MatchKeywords, "\n")
-			for _, floor := range newFloors {
-				if strings.TrimSpace(floor.Content) == "" {
+			for _, kw := range keywords {
+				kw = strings.TrimSpace(kw)
+				if kw == "" {
 					continue
 				}
-				for _, kw := range keywords {
-					kw = strings.TrimSpace(kw)
-					if kw == "" {
-						continue
-					}
-					if strings.Contains(strings.ToLower(floor.Content), strings.ToLower(kw)) {
-						matched = true
-						quoteID = strconv.FormatInt(floor.ID, 10)
-						floorNum = strconv.FormatInt(floor.Floor, 10)
-						atUsername = floor.Username
-						atPortrait = floor.Portrait
-						replyUID = strconv.FormatInt(floor.AuthorID, 10)
+				if strings.Contains(strings.ToLower(floor.Content), strings.ToLower(kw)) {
+					matched = true
+					quoteID = strconv.FormatInt(floor.ID, 10)
+					floorNum = strconv.FormatInt(floor.Floor, 10)
+					atUsername = floor.Username
+					atPortrait = floor.Portrait
+					replyUID = strconv.FormatInt(floor.AuthorID, 10)
 
-						if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
-							subMatched := false
-							for _, sp := range floor.SubPosts {
-								if strings.TrimSpace(sp.Content) == "" {
-									continue
-								}
-								if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
-									subPostID = strconv.FormatInt(sp.ID, 10)
-									replyUID = strconv.FormatInt(sp.AuthorID, 10)
-									atUsername = sp.Username
-									atPortrait = sp.Portrait
-									subMatched = true
-									break
-								}
+					if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
+						subMatched := false
+						for _, sp := range floor.SubPosts {
+							if strings.TrimSpace(sp.Content) == "" {
+								continue
 							}
-							if !subMatched {
-								subPostID = ""
-								atUsername = floor.Username
-								atPortrait = floor.Portrait
-								replyUID = strconv.FormatInt(floor.AuthorID, 10)
+							if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
+								subPostID = strconv.FormatInt(sp.ID, 10)
+								replyUID = strconv.FormatInt(sp.AuthorID, 10)
+								atUsername = sp.Username
+								atPortrait = sp.Portrait
+								subMatched = true
+								break
 							}
-						} else {
+						}
+						if !subMatched {
 							subPostID = ""
 							atUsername = floor.Username
 							atPortrait = floor.Portrait
 							replyUID = strconv.FormatInt(floor.AuthorID, 10)
 						}
-						goto keywordMatched
+					} else {
+						subPostID = ""
+						atUsername = floor.Username
+						atPortrait = floor.Portrait
+						replyUID = strconv.FormatInt(floor.AuthorID, 10)
 					}
+					goto keywordMatched
 				}
 			}
-		keywordMatched:
-			if !matched {
-				newPid := task.LastRepliedPid
-				if !allowReplied {
-					newPid = keywordMaxSeenPid
-				}
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":              pid,
-					"last_replied_pid": newPid,
-					"last_status":      "skipped",
-					"last_error":       "",
-					"last_check_time":  now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：关键词未匹配（水位推进至%d）<br>", logTime, keywordMaxSeenPid))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
 		}
-
-		// 随机回复间隔
-		effectiveInterval := task.ReplyIntervalMin
-		if effectiveInterval <= 0 {
-			effectiveInterval = task.ReplyInterval // fallback to old field
-		}
-		if task.ReplyIntervalMax > task.ReplyIntervalMin {
-			effectiveInterval = task.ReplyIntervalMin + int32(mrand.Intn(int(task.ReplyIntervalMax-task.ReplyIntervalMin)+1))
-		}
-		if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(effectiveInterval) {
-			remaining := effectiveInterval - int32(now-int64(task.LastReplyTime))
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             pid,
-				"last_status":     "skipped",
-				"last_error":      "",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：回复间隔未到（需等待 %d 秒）<br>", logTime, remaining))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-
-		if task.ReplyProbability < 100 {
-			r := mrand.Intn(100) + 1
-			if r > int(task.ReplyProbability) {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_status":     "skipped",
-					"last_error":      "",
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：概率未命中<br>", logTime))
-				_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-				continue
-			}
-		}
-
-		tbsResp, err := _function.GetTbs(bduss)
-		if err != nil || tbsResp == nil || tbsResp.Tbs == "" {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             pid,
-				"last_status":     "error",
-				"last_error":      "获取TBS失败",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：获取TBS失败<br>", logTime))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-		tbs := tbsResp.Tbs
-
-		fid := _function.GetFid(task.Fname)
-		if fid == 0 {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":             pid,
-				"last_status":     "error",
-				"last_error":      "获取fid失败",
-				"last_check_time": now,
-			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：获取fid失败<br>", logTime))
-			_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-			continue
-		}
-
-		// 随机选择回复内容
-		replyContent := task.ReplyContent
-		if task.ReplyContentList != "" {
-			lines := strings.Split(task.ReplyContentList, "\n")
-			var validLines []string
-			for _, line := range lines {
-				if strings.TrimSpace(line) != "" {
-					validLines = append(validLines, line)
-				}
-			}
-			if len(validLines) > 0 {
-				replyContent = validLines[mrand.Intn(len(validLines))]
-			}
-		}
-
-		floorForReplace := strconv.FormatInt(replyCount, 10)
-		if triggerMode == "keyword" && floorNum != "" {
-			floorForReplace = floorNum
-		}
-		finalContent := strings.NewReplacer(
-			"{floor}", floorForReplace,
-			"{time}", time.Unix(now, 0).Format("2006-01-02 15:04:05"),
-			"{date}", time.Unix(now, 0).Format("2006-01-02"),
-			"{tid}", strconv.FormatInt(task.Tid, 10),
-			"{username}", atUsername,
-		).Replace(replyContent)
-
-		if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
-			finalContent = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, finalContent)
-		}
-
-		showName := "贴吧用户"
-		result := autoreplyAddPost(bduss, stoken, tbs, task.Fname, fid, task.Tid, finalContent, showName, quoteID, replyUID, floorNum, subPostID)
-
-		if result.Success {
-			// 更新全局最后回复时间戳
-			_function.SetOption(weltolkAutoreplyLastGlobalReplyKey, int(now))
-
-			newLastRepliedPid := task.LastRepliedPid
+	keywordMatched:
+		if !matched {
+			newPid := task.LastRepliedPid
 			if !allowReplied {
-				if triggerMode == "keyword" {
-					newLastRepliedPid = keywordMaxSeenPid
-				} else {
-					newLastRepliedPid = weltolkToInt64(quoteID)
-				}
+				newPid = keywordMaxSeenPid
 			}
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":              pid,
-				"last_floor":       replyCount,
-				"last_replied_pid": newLastRepliedPid,
-				"last_reply_time":  now,
-				"retry_count":      0,
-				"last_status":      "ok",
-				"last_error":       "",
-				"last_check_time":  now,
-				"success_count":    gorm.Expr("success_count + 1"),
-			})
-			// Check if max count reached after incrementing
-			if task.MaxCount > 0 && task.SuccessCount+1 >= task.MaxCount {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"enabled":     0,
-					"last_status": "completed",
-					"last_error":  "已达到最大执行次数",
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：成功（已达到最大执行次数 %d/%d，任务已自动禁用）<br>", logTime, task.SuccessCount+1, task.MaxCount))
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "关键词未匹配", fmt.Sprintf("执行结果：跳过：关键词未匹配（水位推进至%d）", keywordMaxSeenPid))
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Update("last_replied_pid", newPid)
+			return
+		}
+	}
+
+	// 随机回复间隔
+	effectiveInterval := calcEffectiveInterval(task.ReplyIntervalMin, task.ReplyIntervalMax, task.ReplyInterval)
+	if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(effectiveInterval) {
+		remaining := effectiveInterval - int32(now-int64(task.LastReplyTime))
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", fmt.Sprintf("间隔未到（%d秒后）", remaining), fmt.Sprintf("执行结果：跳过：回复间隔未到（本次需等待 %d 秒，当前间隔设置 %d-%d 秒）", remaining, task.ReplyIntervalMin, task.ReplyIntervalMax))
+		return
+	}
+
+	if task.ReplyProbability < 100 {
+		r := autoreplyRand.Intn(100) + 1
+		if r > int(task.ReplyProbability) {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "概率未命中", "执行结果：跳过：概率未命中")
+			return
+		}
+	}
+
+	tbsResp, err := _function.GetTbs(bduss)
+	if err != nil || tbsResp == nil || tbsResp.Tbs == "" {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取TBS失败", "执行结果：跳过：获取TBS失败")
+		return
+	}
+	tbs := tbsResp.Tbs
+
+	fid := _function.GetFid(task.Fname)
+	if fid == 0 {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取fid失败", "执行结果：跳过：获取fid失败")
+		return
+	}
+
+	// 随机选择回复内容
+	replyContent := task.ReplyContent
+	if task.ReplyContentList != "" {
+		lines := strings.Split(task.ReplyContentList, "\n")
+		var validLines []string
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				validLines = append(validLines, line)
+			}
+		}
+		if len(validLines) > 0 {
+			replyContent = validLines[autoreplyRand.Intn(len(validLines))]
+		}
+	}
+
+	floorForReplace := strconv.FormatInt(replyCount, 10)
+	if triggerMode == "keyword" && floorNum != "" {
+		floorForReplace = floorNum
+	}
+	finalContent := strings.NewReplacer(
+		"{floor}", floorForReplace,
+		"{time}", time.Unix(now, 0).Format("2006-01-02 15:04:05"),
+		"{date}", time.Unix(now, 0).Format("2006-01-02"),
+		"{tid}", strconv.FormatInt(task.Tid, 10),
+		"{username}", atUsername,
+	).Replace(replyContent)
+
+	if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
+		finalContent = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, finalContent)
+	}
+
+	showName := "贴吧用户"
+	result := autoreplyAddPost(bduss, stoken, tbs, task.Fname, fid, task.Tid, finalContent, showName, quoteID, replyUID, floorNum, subPostID)
+
+	if result.Success {
+		// 更新全局最后回复时间戳
+		_function.SetOption(weltolkAutoreplyLastGlobalReplyKey, int(now))
+
+		newLastRepliedPid := task.LastRepliedPid
+		if !allowReplied {
+			if triggerMode == "keyword" {
+				newLastRepliedPid = keywordMaxSeenPid
 			} else {
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作成功<br>", logTime))
+				newLastRepliedPid = weltolkToInt64(quoteID)
 			}
-		} else if result.NeedVcode {
-			vcodePid := task.LastRepliedPid
-			if !allowReplied {
-				if triggerMode == "keyword" {
-					vcodePid = keywordMaxSeenPid
-				} else {
-					vcodePid = weltolkToInt64(quoteID)
-				}
-			}
+		}
+		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+			"pid":              pid,
+			"last_floor":       replyCount,
+			"last_replied_pid": newLastRepliedPid,
+			"last_reply_time":  now,
+			"retry_count":      0,
+			"last_status":      "ok",
+			"last_error":       "",
+			"last_check_time":  now,
+			"success_count":    gorm.Expr("success_count + 1"),
+		})
+		// Check if max count reached after incrementing
+		if task.MaxCount > 0 && task.SuccessCount+1 >= task.MaxCount {
 			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-				"pid":              pid,
-				"last_floor":       replyCount,
-				"last_replied_pid": vcodePid,
-				"last_status":      "vcode",
-				"last_error":       "触发验证码",
-				"last_check_time":  now,
+				"enabled":     0,
+				"last_status": "completed",
+				"last_error":  "已达到最大执行次数",
 			})
-			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：触发验证码<br>", logTime))
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：成功（已达到最大执行次数 %d/%d，任务已自动禁用）<br>", logTime, task.SuccessCount+1, task.MaxCount))
 		} else {
-			newRetry := task.RetryCount + 1
-			if newRetry >= 3 {
-				lastError := fmt.Sprintf("重试次数达上限: [%d] %s", result.ErrorCode, result.ErrorMsg)
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_floor":      replyCount,
-					"retry_count":     newRetry,
-					"enabled":         0,
-					"last_status":     "error",
-					"last_error":      lastError,
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：失败：重试次数达上限，任务已禁用#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg))
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作成功<br>", logTime))
+		}
+	} else if result.NeedVcode {
+		vcodePid := task.LastRepliedPid
+		if !allowReplied {
+			if triggerMode == "keyword" {
+				vcodePid = keywordMaxSeenPid
 			} else {
-				lastError := fmt.Sprintf("[错误码 %d] %s", result.ErrorCode, result.ErrorMsg)
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
-					"pid":             pid,
-					"last_floor":      replyCount,
-					"retry_count":     newRetry,
-					"last_status":     "error",
-					"last_error":      lastError,
-					"last_check_time": now,
-				})
-				weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作失败#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg))
+				vcodePid = weltolkToInt64(quoteID)
 			}
 		}
-
-		// 真正执行了任务（成功/失败/验证码），推进高水位并跳出
-		executed = true
-		_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
-		break
+		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+			"pid":              pid,
+			"last_floor":       replyCount,
+			"last_replied_pid": vcodePid,
+			"last_status":      "vcode",
+			"last_error":       "触发验证码",
+			"last_check_time":  now,
+		})
+		weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：触发验证码<br>", logTime))
+	} else {
+		newRetry := task.RetryCount + 1
+		if newRetry >= 3 {
+			lastError := fmt.Sprintf("重试次数达上限: [%d] %s", result.ErrorCode, result.ErrorMsg)
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+				"pid":             pid,
+				"last_floor":      replyCount,
+				"retry_count":     newRetry,
+				"enabled":         0,
+				"last_status":     "error",
+				"last_error":      lastError,
+				"last_check_time": now,
+			})
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：失败：重试次数达上限，任务已禁用#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg))
+		} else {
+			lastError := fmt.Sprintf("[错误码 %d] %s", result.ErrorCode, result.ErrorMsg)
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+				"pid":             pid,
+				"last_floor":      replyCount,
+				"retry_count":     newRetry,
+				"last_status":     "error",
+				"last_error":      lastError,
+				"last_check_time": now,
+			})
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作失败#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg))
+		}
 	}
 
-	// 如果没有任何启用的任务，重置水位以便下次从头开始
-	if len(tasks) == 0 {
-		_function.SetOption(weltolkAutoreplyHighWaterKey, 0)
-	}
+	// 任务处理完成，推进高水位
+	_function.SetOption(highWaterKey, int(taskID)+1)
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Install() error {
