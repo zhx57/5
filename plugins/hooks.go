@@ -160,6 +160,22 @@ func InitPluginList() {
 		for optionKey, optionValidator := range PluginList[pluginStatus.Name].GetInfo().SettingOptions {
 			PluginOptionValidatorMap.Store(optionKey, optionValidator.Validate, -1)
 		}
+
+		// auto upgrade: 当数据库记录的版本与代码版本不一致时，自动调用 Upgrade()
+		// 用于在启动时执行迁移、清理废弃选项等操作
+		if pluginStatus.Ver != "-1" {
+			currentVer := PluginList[pluginStatus.Name].GetInfo().Version
+			if pluginStatus.Ver != currentVer {
+				slog.Info("plugin.auto-upgrade", "name", pluginStatus.Name, "old_ver", pluginStatus.Ver, "new_ver", currentVer)
+				if err := PluginList[pluginStatus.Name].Upgrade(); err != nil {
+					slog.Error("plugin.auto-upgrade", "name", pluginStatus.Name, "error", err)
+				}
+				// 更新数据库中的版本号，保留原有 status
+				_function.GormDB.W.Model(&model.TcPlugin{}).Where("name = ?", pluginStatus.Name).Update("ver", currentVer)
+				// 同步内存中的版本号
+				PluginList[pluginStatus.Name].GetInfo().Info.Ver = currentVer
+			}
+		}
 	}
 	for key := range pluginNameSet {
 		delete(pluginNameSet, key)
@@ -190,7 +206,7 @@ func UpdatePluginInfo(name string, version string, status bool, options string) 
 	info := PluginList[name].GetInfo()
 	PluginList[name].SetDBInfo(&model.TcPlugin{
 		Name:    name,
-		Status:  0,
+		Status:  _function.BoolToTinyInt(status),
 		Ver:     info.Version,
 		Options: "",
 	})

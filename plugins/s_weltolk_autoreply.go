@@ -76,7 +76,7 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameCN:      "自动回帖",
 		PluginNameCNShort: "自动回帖",
 		PluginNameFE:      "weltolk_autoreply",
-		Version:           "1.0",
+		Version:           "1.1",
 		Options: map[string]string{
 			"weltolk_autoreply_id": "0",
 		},
@@ -1462,10 +1462,14 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Install() error {
 	for k, v := range pluginInfo.Options {
 		_function.SetOption(k, v)
 	}
-	err = UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
+	// 安装时保留之前已启用的状态，避免重装后插件被意外禁用
+	previousStatus := pluginInfo.GetSwitch()
+	err = UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, previousStatus, "")
 	if err != nil {
 		return err
 	}
+	// 清理已废弃的全局任务数量限额选项
+	_function.DeleteOption("weltolk_autoreply_limit")
 	// AutoMigrate 同时支持创建新表和添加新列，确保升级后新字段存在
 	return _function.GormDB.W.AutoMigrate(&model.TcWeltolkAutoreplyTasks{})
 }
