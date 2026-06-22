@@ -44,6 +44,15 @@ type WeltolkAutoReplyPluginType struct {
 var autoreplyRand = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 var autoreplyRandMu sync.Mutex
 
+// autoreplyCleanupOnce 确保启动后只清理一次废弃的选项
+var autoreplyCleanupOnce sync.Once
+
+// autoreplyCleanupOldOptions 删除已废弃的全局任务数量限额选项，
+// 避免它仍残留在数据库中并在系统设置页面显示为输入框。
+func autoreplyCleanupOldOptions() {
+	_function.DeleteOption("weltolk_autoreply_limit")
+}
+
 // autoreplyRandIntn 返回 [0, n) 的非负伪随机数，线程安全
 func autoreplyRandIntn(n int) int {
 	if n <= 0 {
@@ -1033,6 +1042,9 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 	}
 	defer pluginInfo.PluginInfo.SetActive(false)
 
+	// 启动后首次运行时清理已废弃的全局任务数量限额选项
+	autoreplyCleanupOnce.Do(autoreplyCleanupOldOptions)
+
 	now := time.Now().Unix()
 	logTime := weltolkAutoreplyNowString(now)
 
@@ -1469,6 +1481,8 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Delete() error {
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Upgrade() error {
+	// 清理已废弃的全局任务数量限额选项，避免仍在系统设置页面显示
+	_function.DeleteOption("weltolk_autoreply_limit")
 	return _function.GormDB.W.AutoMigrate(&model.TcWeltolkAutoreplyTasks{})
 }
 
