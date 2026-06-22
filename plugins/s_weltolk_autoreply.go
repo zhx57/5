@@ -116,6 +116,11 @@ func weltolkAutoreplyAppendLog(taskID int32, entry string) {
 		return
 	}
 	task.Log += entry
+	// 限制日志最大长度，保留最新的部分
+	const maxLogLen = 50000
+	if len(task.Log) > maxLogLen {
+		task.Log = task.Log[len(task.Log)-maxLogLen:]
+	}
 	_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Update("log", task.Log)
 }
 
@@ -892,11 +897,15 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 	}
 
 	// 顺序执行：每分钟只执行1个任务，避免短时间内大量回复
-	if len(tasks) > 0 {
-		tasks = tasks[:1]
-	}
+	// 跳过的任务不推进高水位，只有真正执行了的任务才推进
+	executed := false
 
 	for _, task := range tasks {
+		// 每分钟只执行1个任务，已执行的跳出循环
+		if executed {
+			break
+		}
+
 		atUsername := ""
 		atPortrait := ""
 		quoteID := ""
@@ -925,10 +934,8 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 			nowTime := time.Now().Format("15:04")
 			inWindow := false
 			if task.ActiveTimeStart <= task.ActiveTimeEnd {
-				// 正常时间段，如 08:00-22:00
 				inWindow = nowTime >= task.ActiveTimeStart && nowTime < task.ActiveTimeEnd
 			} else {
-				// 跨午夜时间段，如 22:00-08:00
 				inWindow = nowTime >= task.ActiveTimeStart || nowTime < task.ActiveTimeEnd
 			}
 			if !inWindow {
@@ -1344,10 +1351,16 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 			}
 		}
 
+		// 真正执行了任务（成功/失败/验证码），推进高水位并跳出
+		executed = true
 		_function.SetOption(weltolkAutoreplyHighWaterKey, int(taskID)+1)
+		break
 	}
 
-	_function.SetOption(weltolkAutoreplyHighWaterKey, 0)
+	// 如果没有任何启用的任务，重置水位以便下次从头开始
+	if len(tasks) == 0 {
+		_function.SetOption(weltolkAutoreplyHighWaterKey, 0)
+	}
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Install() error {
@@ -1691,7 +1704,7 @@ func PluginWeltolkAutoReplyListDelete(c echo.Context) error {
 
 	if err := _function.GormDB.W.Where("id = ? AND uid = ?", id, uid).Delete(&model.TcWeltolkAutoreplyTasks{}).Error; err != nil {
 		slog.Error("plugin.weltolk-autoreply.list.delete", "uid", uid, "id", id, "error", err)
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "删除失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
 	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
 }
@@ -1717,7 +1730,7 @@ func PluginWeltolkAutoReplyListToggle(c echo.Context) error {
 	if err := _function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Updates(map[string]any{
 		"enabled": newEnabled,
 	}).Error; err != nil {
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "切换失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
 	}
 
 	task.Enabled = newEnabled
@@ -1728,7 +1741,7 @@ func PluginWeltolkAutoReplyListEmpty(c echo.Context) error {
 	uid := c.Get("uid").(string)
 	if err := _function.GormDB.W.Where("uid = ?", uid).Delete(&model.TcWeltolkAutoreplyTasks{}).Error; err != nil {
 		slog.Error("plugin.weltolk-autoreply.list.empty", "uid", uid, "error", err)
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "删除失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
 	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", _function.EchoEmptyObject, "tbsign"))
 }
