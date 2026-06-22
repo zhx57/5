@@ -1374,7 +1374,7 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Delete() error {
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Upgrade() error {
-	return nil
+	return _function.GormDB.W.AutoMigrate(&model.TcWeltolkAutoreplyTasks{})
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) RemoveAccount(_type string, id int32, tx *gorm.DB) error {
@@ -1580,7 +1580,7 @@ func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 	}
 	if err := _function.GormDB.W.Create(task).Error; err != nil {
 		slog.Error("plugin.weltolk-autoreply.list.add", "uid", uid, "error", err)
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
 	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
 }
@@ -1666,7 +1666,7 @@ func PluginWeltolkAutoReplyListEdit(c echo.Context) error {
 
 	if err := _function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Updates(updates).Error; err != nil {
 		slog.Error("plugin.weltolk-autoreply.list.edit", "uid", uid, "id", id, "error", err)
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "未知错误", _function.EchoEmptyObject, "tbsign"))
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
 	}
 
 	// Read updated task
