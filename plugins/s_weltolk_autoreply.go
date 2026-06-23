@@ -76,7 +76,7 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameCN:      "自动回帖",
 		PluginNameCNShort: "自动回帖",
 		PluginNameFE:      "weltolk_autoreply",
-		Version:           "1.1",
+		Version:           "1.0",
 		Options: map[string]string{
 			"weltolk_autoreply_id": "0",
 		},
@@ -1462,9 +1462,7 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Install() error {
 	for k, v := range pluginInfo.Options {
 		_function.SetOption(k, v)
 	}
-	// 安装时保留之前已启用的状态，避免重装后插件被意外禁用
-	previousStatus := pluginInfo.GetSwitch()
-	err = UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, previousStatus, "")
+	err = UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
 	if err != nil {
 		return err
 	}
