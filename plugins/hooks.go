@@ -190,7 +190,7 @@ func UpdatePluginInfo(name string, version string, status bool, options string) 
 	info := PluginList[name].GetInfo()
 	PluginList[name].SetDBInfo(&model.TcPlugin{
 		Name:    name,
-		Status:  0,
+		Status:  _function.BoolToTinyInt(status),
 		Ver:     info.Version,
 		Options: "",
 	})
