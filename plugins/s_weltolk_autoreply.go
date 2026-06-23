@@ -104,9 +104,10 @@ const weltolkAutoreplyHighWaterKey = "weltolk_autoreply_high_water"
 // 使用 seed 确保同一任务在同一 LastReplyTime 下计算出的间隔稳定，
 // 避免每次 cron tick 都重新随机导致间隔不断变化、任务可能永远无法执行。
 // 规则：min>0 && max>=min -> [min, max]
-//      min>0 && max<min  -> min（按min固定）
-//      min<=0 && max>0   -> [60, max]，避免0导致疯狂回复
-//      min<=0 && max<=0  -> 使用旧的 reply_interval 字段，若仍<=0则默认60
+//
+//	min>0 && max<min  -> min（按min固定）
+//	min<=0 && max>0   -> [60, max]，避免0导致疯狂回复
+//	min<=0 && max<=0  -> 使用旧的 reply_interval 字段，若仍<=0则默认60
 func calcEffectiveInterval(replyIntervalMin, replyIntervalMax, replyInterval int32, seed int64) int32 {
 	minVal := replyIntervalMin
 	maxVal := replyIntervalMax
@@ -1214,24 +1215,30 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 			return
 		}
 		latest := latestFloors[0]
-		quoteID = strconv.FormatInt(latest.ID, 10)
-		replyUID = strconv.FormatInt(latest.AuthorID, 10)
 		floorNum = strconv.FormatInt(latest.Floor, 10)
 		atUsername = latest.Username
 		atPortrait = latest.Portrait
 		subPostID = ""
-		// 回复目标为楼中楼时，回复最新楼层的第一个楼中楼（如果有）
-		if replyTarget == "subpost" && len(latest.SubPosts) > 0 {
-			for _, sp := range latest.SubPosts {
-				if strings.TrimSpace(sp.Content) == "" {
-					continue
+		if replyTarget == "subpost" {
+			// 回复楼中楼：引用最新楼层，并指定楼中楼 ID
+			quoteID = strconv.FormatInt(latest.ID, 10)
+			replyUID = strconv.FormatInt(latest.AuthorID, 10)
+			if len(latest.SubPosts) > 0 {
+				for _, sp := range latest.SubPosts {
+					if strings.TrimSpace(sp.Content) == "" {
+						continue
+					}
+					subPostID = strconv.FormatInt(sp.ID, 10)
+					replyUID = strconv.FormatInt(sp.AuthorID, 10)
+					atUsername = sp.Username
+					atPortrait = sp.Portrait
+					break
 				}
-				subPostID = strconv.FormatInt(sp.ID, 10)
-				replyUID = strconv.FormatInt(sp.AuthorID, 10)
-				atUsername = sp.Username
-				atPortrait = sp.Portrait
-				break
 			}
+		} else {
+			// 回复主题：不引用任何楼层，直接在帖子下发帖
+			quoteID = ""
+			replyUID = ""
 		}
 	}
 
@@ -1279,34 +1286,40 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 				}
 				if strings.Contains(strings.ToLower(floor.Content), strings.ToLower(kw)) {
 					matched = true
-					quoteID = strconv.FormatInt(floor.ID, 10)
 					floorNum = strconv.FormatInt(floor.Floor, 10)
 					atUsername = floor.Username
 					atPortrait = floor.Portrait
 					replyUID = strconv.FormatInt(floor.AuthorID, 10)
 
-					if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
-						subMatched := false
-						for _, sp := range floor.SubPosts {
-							if strings.TrimSpace(sp.Content) == "" {
-								continue
+					if replyTarget == "subpost" {
+						// 回复楼中楼：引用命中楼层，并指定楼中楼 ID
+						quoteID = strconv.FormatInt(floor.ID, 10)
+						subPostID = ""
+						if len(floor.SubPosts) > 0 {
+							subMatched := false
+							for _, sp := range floor.SubPosts {
+								if strings.TrimSpace(sp.Content) == "" {
+									continue
+								}
+								if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
+									subPostID = strconv.FormatInt(sp.ID, 10)
+									replyUID = strconv.FormatInt(sp.AuthorID, 10)
+									atUsername = sp.Username
+									atPortrait = sp.Portrait
+									subMatched = true
+									break
+								}
 							}
-							if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
-								subPostID = strconv.FormatInt(sp.ID, 10)
-								replyUID = strconv.FormatInt(sp.AuthorID, 10)
-								atUsername = sp.Username
-								atPortrait = sp.Portrait
-								subMatched = true
-								break
+							if !subMatched {
+								subPostID = ""
+								atUsername = floor.Username
+								atPortrait = floor.Portrait
+								replyUID = strconv.FormatInt(floor.AuthorID, 10)
 							}
-						}
-						if !subMatched {
-							subPostID = ""
-							atUsername = floor.Username
-							atPortrait = floor.Portrait
-							replyUID = strconv.FormatInt(floor.AuthorID, 10)
 						}
 					} else {
+						// 回复主题：不引用任何楼层，直接在帖子下发帖
+						quoteID = ""
 						subPostID = ""
 						atUsername = floor.Username
 						atPortrait = floor.Portrait
@@ -1741,22 +1754,22 @@ func PluginWeltolkAutoReplyListEdit(c echo.Context) error {
 	}
 
 	updates := map[string]any{
-		"fname":               strings.TrimSpace(binding.Fname),
-		"tid":                 binding.Tid,
-		"reply_content":       binding.ReplyContent,
-		"reply_content_list":  binding.ReplyContentList,
-		"reply_interval":      binding.ReplyIntervalMin,
-		"reply_interval_min":  binding.ReplyIntervalMin,
-		"reply_interval_max":  binding.ReplyIntervalMax,
-		"reply_probability":   binding.ReplyProbability,
-		"trigger_mode":        binding.TriggerMode,
-		"reply_target":        binding.ReplyTarget,
-		"allow_replied":       binding.AllowReplied,
-		"match_keywords":      binding.MatchKeywords,
-		"enabled":             binding.Enabled,
-		"max_count":           binding.MaxCount,
-		"active_time_start":   binding.ActiveTimeStart,
-		"active_time_end":     binding.ActiveTimeEnd,
+		"fname":              strings.TrimSpace(binding.Fname),
+		"tid":                binding.Tid,
+		"reply_content":      binding.ReplyContent,
+		"reply_content_list": binding.ReplyContentList,
+		"reply_interval":     binding.ReplyIntervalMin,
+		"reply_interval_min": binding.ReplyIntervalMin,
+		"reply_interval_max": binding.ReplyIntervalMax,
+		"reply_probability":  binding.ReplyProbability,
+		"trigger_mode":       binding.TriggerMode,
+		"reply_target":       binding.ReplyTarget,
+		"allow_replied":      binding.AllowReplied,
+		"match_keywords":     binding.MatchKeywords,
+		"enabled":            binding.Enabled,
+		"max_count":          binding.MaxCount,
+		"active_time_start":  binding.ActiveTimeStart,
+		"active_time_end":    binding.ActiveTimeEnd,
 	}
 	if binding.Pid > 0 {
 		updates["pid"] = binding.Pid
@@ -1918,24 +1931,30 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 				}
 				if strings.Contains(strings.ToLower(floor.Content), strings.ToLower(kw)) {
 					matched = true
-					quoteID = strconv.FormatInt(floor.ID, 10)
 					floorNum = strconv.FormatInt(floor.Floor, 10)
 					atUsername = floor.Username
 					atPortrait = floor.Portrait
 					replyUID = strconv.FormatInt(floor.AuthorID, 10)
-					if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
-						for _, sp := range floor.SubPosts {
-							if strings.TrimSpace(sp.Content) == "" {
-								continue
-							}
-							if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
-								subPostID = strconv.FormatInt(sp.ID, 10)
-								replyUID = strconv.FormatInt(sp.AuthorID, 10)
-								atUsername = sp.Username
-								atPortrait = sp.Portrait
-								break
+					if replyTarget == "subpost" {
+						quoteID = strconv.FormatInt(floor.ID, 10)
+						subPostID = ""
+						if len(floor.SubPosts) > 0 {
+							for _, sp := range floor.SubPosts {
+								if strings.TrimSpace(sp.Content) == "" {
+									continue
+								}
+								if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
+									subPostID = strconv.FormatInt(sp.ID, 10)
+									replyUID = strconv.FormatInt(sp.AuthorID, 10)
+									atUsername = sp.Username
+									atPortrait = sp.Portrait
+									break
+								}
 							}
 						}
+					} else {
+						quoteID = ""
+						subPostID = ""
 					}
 					goto testMatched
 				}
@@ -1949,23 +1968,28 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 		latestFloors := weltolkGetLastFloorContent(binding.Tid, bduss, 1, totalPage)
 		if len(latestFloors) > 0 {
 			latest := latestFloors[0]
-			quoteID = strconv.FormatInt(latest.ID, 10)
-			replyUID = strconv.FormatInt(latest.AuthorID, 10)
 			floorNum = strconv.FormatInt(latest.Floor, 10)
 			atUsername = latest.Username
 			atPortrait = latest.Portrait
-			// 回复目标为楼中楼时，回复最新楼层的第一个楼中楼（如果有）
-			if replyTarget == "subpost" && len(latest.SubPosts) > 0 {
-				for _, sp := range latest.SubPosts {
-					if strings.TrimSpace(sp.Content) == "" {
-						continue
+			subPostID = ""
+			if replyTarget == "subpost" {
+				quoteID = strconv.FormatInt(latest.ID, 10)
+				replyUID = strconv.FormatInt(latest.AuthorID, 10)
+				if len(latest.SubPosts) > 0 {
+					for _, sp := range latest.SubPosts {
+						if strings.TrimSpace(sp.Content) == "" {
+							continue
+						}
+						subPostID = strconv.FormatInt(sp.ID, 10)
+						replyUID = strconv.FormatInt(sp.AuthorID, 10)
+						atUsername = sp.Username
+						atPortrait = sp.Portrait
+						break
 					}
-					subPostID = strconv.FormatInt(sp.ID, 10)
-					replyUID = strconv.FormatInt(sp.AuthorID, 10)
-					atUsername = sp.Username
-					atPortrait = sp.Portrait
-					break
 				}
+			} else {
+				quoteID = ""
+				replyUID = ""
 			}
 		}
 	}
