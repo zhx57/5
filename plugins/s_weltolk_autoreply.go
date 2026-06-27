@@ -2,18 +2,13 @@ package _plugin
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/rand"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
-	"math/big"
 	mrand "math/rand"
 	"net"
 	"net/http"
@@ -24,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"gorm.io/gorm"
 
@@ -177,400 +171,6 @@ func weltolkAutoreplySkipTask(taskID int32, pid int32, now int64, logTime, highW
 	_function.SetOption(highWaterKey, int(taskID)+1)
 }
 
-// protobuf helpers
-
-func autoreplyEncodeVarint(v uint64) []byte {
-	var buf [10]byte
-	var n int
-	for v >= 0x80 {
-		buf[n] = byte(v&0x7F | 0x80)
-		n++
-		v >>= 7
-	}
-	buf[n] = byte(v)
-	n++
-	return buf[:n]
-}
-
-func autoreplyEncodeTag(fieldNumber, wireType int) []byte {
-	return autoreplyEncodeVarint(uint64(fieldNumber<<3) | uint64(wireType))
-}
-
-func autoreplyEncodeString(fieldNumber int, s string) []byte {
-	b := []byte(s)
-	return bytes.Join([][]byte{
-		autoreplyEncodeTag(fieldNumber, 2),
-		autoreplyEncodeVarint(uint64(len(b))),
-		b,
-	}, nil)
-}
-
-func autoreplyEncodeInt32(fieldNumber int, v int32) []byte {
-	return append(autoreplyEncodeTag(fieldNumber, 0), autoreplyEncodeVarint(uint64(v))...)
-}
-
-func autoreplyEncodeInt64(fieldNumber int, v int64) []byte {
-	return append(autoreplyEncodeTag(fieldNumber, 0), autoreplyEncodeVarint(uint64(v))...)
-}
-
-func autoreplyEncodeDouble(fieldNumber int, v float64) []byte {
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
-	return append(autoreplyEncodeTag(fieldNumber, 1), buf...)
-}
-
-func autoreplyEncodeMessage(fieldNumber int, data []byte) []byte {
-	return bytes.Join([][]byte{
-		autoreplyEncodeTag(fieldNumber, 2),
-		autoreplyEncodeVarint(uint64(len(data))),
-		data,
-	}, nil)
-}
-
-func autoreplyReadVarint(data []byte, pos int) (uint64, int, bool) {
-	var value uint64
-	var shift uint
-	for pos < len(data) {
-		b := data[pos]
-		pos++
-		value |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			return value, pos, true
-		}
-		shift += 7
-		if shift > 63 {
-			return 0, pos, false
-		}
-	}
-	return 0, pos, false
-}
-
-func autoreplyRandomHex(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func autoreplyRandomAlphanumeric(n int, upper bool) string {
-	const chars = "0123456789abcdefghijklmnopqrstuvwxyz"
-	out := chars
-	if upper {
-		out = strings.ToUpper(chars)
-	}
-	var sb strings.Builder
-	for i := 0; i < n; i++ {
-		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(out))))
-		sb.WriteByte(out[idx.Int64()])
-	}
-	return sb.String()
-}
-
-func autoreplyGenerateDeviceIDs() map[string]string {
-	androidID := autoreplyRandomHex(8)
-	u := uuid.New().String()
-	cuid := "baidutiebaapp" + u
-	cuidGalaxy2 := strings.ToUpper(autoreplyRandomHex(16)) + "|" + autoreplyRandomAlphanumeric(9, true)
-	c3Aid := "A00-" + strings.ToUpper(autoreplyRandomHex(16)) + "-" + autoreplyRandomAlphanumeric(8, true)
-	sampleID := autoreplyRandomAlphanumeric(16, true)
-	return map[string]string{
-		"cuid":         cuid,
-		"cuid_galaxy2": cuidGalaxy2,
-		"c3_aid":       c3Aid,
-		"android_id":   androidID,
-		"z_id":         "",
-		"sample_id":    sampleID,
-	}
-}
-
-func autoreplyBuildPostProto(bduss, stoken, tbs, fname string, fid, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) []byte {
-	now := time.Now()
-	timestamp := now.UnixMilli()
-	eventDay := fmt.Sprintf("%d%d%d", now.Year(), int(now.Month()), now.Day())
-	installTime := timestamp - 86400*30
-
-	dev := autoreplyGenerateDeviceIDs()
-
-	common := bytes.NewBuffer(nil)
-	common.Write(autoreplyEncodeInt32(1, 2))
-	common.Write(autoreplyEncodeString(2, "12.35.1.0"))
-	common.Write(autoreplyEncodeString(3, dev["cuid"]))
-	common.Write(autoreplyEncodeString(5, "000000000000000"))
-	common.Write(autoreplyEncodeString(6, "1020031h"))
-	common.Write(autoreplyEncodeString(7, dev["cuid_galaxy2"]))
-	common.Write(autoreplyEncodeInt64(8, timestamp))
-	common.Write(autoreplyEncodeString(9, "SM-G988N"))
-	common.Write(autoreplyEncodeString(10, bduss))
-	common.Write(autoreplyEncodeString(11, tbs))
-	common.Write(autoreplyEncodeInt32(12, 1))
-	common.Write(autoreplyEncodeString(24, "1.0.3"))
-	common.Write(autoreplyEncodeString(25, "9"))
-	common.Write(autoreplyEncodeString(26, "samsung"))
-	common.Write(autoreplyEncodeString(28, "3.0.0"))
-	common.Write(autoreplyEncodeString(29, ""))
-	common.Write(autoreplyEncodeString(30, stoken))
-	common.Write(autoreplyEncodeString(31, dev["z_id"]))
-	common.Write(autoreplyEncodeString(32, dev["cuid_galaxy2"]))
-	common.Write(autoreplyEncodeString(33, ""))
-	common.Write(autoreplyEncodeString(34, ""))
-	common.Write(autoreplyEncodeString(35, dev["c3_aid"]))
-	common.Write(autoreplyEncodeString(36, dev["sample_id"]))
-	common.Write(autoreplyEncodeInt32(37, 720))
-	common.Write(autoreplyEncodeInt32(38, 1280))
-	common.Write(autoreplyEncodeDouble(39, 1.5))
-	common.Write(autoreplyEncodeInt32(40, 0))
-	common.Write(autoreplyEncodeInt32(41, 0))
-	common.Write(autoreplyEncodeString(42, "2.34.0"))
-	common.Write(autoreplyEncodeString(43, "3340042"))
-	common.Write(autoreplyEncodeString(44, "1038000"))
-	common.Write(autoreplyEncodeInt64(49, installTime))
-	common.Write(autoreplyEncodeInt64(50, installTime))
-	common.Write(autoreplyEncodeInt64(51, installTime))
-	common.Write(autoreplyEncodeString(53, eventDay))
-	common.Write(autoreplyEncodeString(54, dev["android_id"]))
-	common.Write(autoreplyEncodeInt32(55, 1))
-	common.Write(autoreplyEncodeString(56, ""))
-	common.Write(autoreplyEncodeInt32(57, 1))
-	common.Write(autoreplyEncodeString(60, "0"))
-	common.Write(autoreplyEncodeString(61, ""))
-	common.Write(autoreplyEncodeString(62, "tieba/12.35.1.0"))
-	common.Write(autoreplyEncodeInt32(63, 1))
-	common.Write(autoreplyEncodeString(70, "0.4"))
-
-	data := bytes.NewBuffer(nil)
-	data.Write(autoreplyEncodeMessage(1, common.Bytes()))
-	data.Write(autoreplyEncodeString(6, "1"))
-	data.Write(autoreplyEncodeString(7, "0"))
-	data.Write(autoreplyEncodeString(8, "0"))
-	data.Write(autoreplyEncodeString(9, "0"))
-	data.Write(autoreplyEncodeString(10, "0"))
-	data.Write(autoreplyEncodeString(16, "12"))
-	data.Write(autoreplyEncodeString(18, "1"))
-	data.Write(autoreplyEncodeString(19, content))
-	data.Write(autoreplyEncodeString(26, strconv.FormatInt(fid, 10)))
-	if quoteID == "" {
-		data.Write(autoreplyEncodeString(28, ""))
-		data.Write(autoreplyEncodeString(29, ""))
-	}
-	data.Write(autoreplyEncodeString(30, fname))
-	data.Write(autoreplyEncodeString(31, "0"))
-	if quoteID == "" {
-		data.Write(autoreplyEncodeString(32, "0"))
-	}
-	data.Write(autoreplyEncodeString(45, strconv.FormatInt(tid, 10)))
-	if quoteID != "" {
-		data.Write(autoreplyEncodeString(46, quoteID))
-	}
-	data.Write(autoreplyEncodeString(47, "0"))
-	data.Write(autoreplyEncodeString(48, floorNum))
-	if quoteID != "" {
-		data.Write(autoreplyEncodeString(49, quoteID))
-	}
-	if subPostID != "" {
-		data.Write(autoreplyEncodeString(50, subPostID))
-	}
-	data.Write(autoreplyEncodeString(51, "0"))
-	data.Write(autoreplyEncodeString(52, "0"))
-	data.Write(autoreplyEncodeString(53, "0"))
-	if subPostID == "" {
-		if quoteID == "" {
-			data.Write(autoreplyEncodeString(55, "13"))
-		} else {
-			data.Write(autoreplyEncodeString(55, "0"))
-		}
-	}
-	data.Write(autoreplyEncodeString(58, showName))
-	data.Write(autoreplyEncodeString(60, "0"))
-	if quoteID != "" && replyUID != "" {
-		data.Write(autoreplyEncodeString(20, replyUID))
-	}
-	data.Write(autoreplyEncodeInt32(64, 0))
-	data.Write(autoreplyEncodeInt32(67, 0))
-
-	return autoreplyEncodeMessage(1, data.Bytes())
-}
-
-func autoreplyParseError(data []byte) (int, string) {
-	var errorno int
-	var errmsg string
-	pos := 0
-	for pos < len(data) {
-		tag, newPos, ok := autoreplyReadVarint(data, pos)
-		if !ok {
-			break
-		}
-		pos = newPos
-		fieldNumber := int(tag >> 3)
-		wireType := int(tag & 0x07)
-		if wireType == 0 && fieldNumber == 1 {
-			v, np, ok := autoreplyReadVarint(data, pos)
-			if !ok {
-				break
-			}
-			errorno = int(v)
-			pos = np
-		} else if wireType == 2 && fieldNumber == 2 {
-			length, np, ok := autoreplyReadVarint(data, pos)
-			if !ok {
-				break
-			}
-			pos = np
-			end := pos + int(length)
-			if end > len(data) {
-				break
-			}
-			errmsg = string(data[pos:end])
-			pos = end
-		} else {
-			np := autoreplySkipField(data, pos, wireType)
-			if np < 0 {
-				break
-			}
-			pos = np
-		}
-	}
-	return errorno, errmsg
-}
-
-func autoreplyParseNeedVcode(data []byte) bool {
-	needVcode := false
-	pos := 0
-	for pos < len(data) {
-		tag, newPos, ok := autoreplyReadVarint(data, pos)
-		if !ok {
-			break
-		}
-		pos = newPos
-		fieldNumber := int(tag >> 3)
-		wireType := int(tag & 0x07)
-		if wireType == 0 {
-			_, np, ok := autoreplyReadVarint(data, pos)
-			if !ok {
-				break
-			}
-			pos = np
-		} else if wireType == 2 {
-			length, np, ok := autoreplyReadVarint(data, pos)
-			if !ok {
-				break
-			}
-			pos = np
-			end := pos + int(length)
-			if end > len(data) {
-				break
-			}
-			if fieldNumber == 14 {
-				spos := 0
-				for spos < end-pos {
-					stag, snp, ok := autoreplyReadVarint(data[pos:end], spos)
-					if !ok {
-						break
-					}
-					spos = snp
-					sfield := int(stag >> 3)
-					swire := int(stag & 0x07)
-					if swire == 2 && sfield == 3 {
-						slen, snp2, ok := autoreplyReadVarint(data[pos:end], spos)
-						if ok {
-							spos = snp2
-							vend := spos + int(slen)
-							if vend <= end-pos {
-								v := string(data[pos+spos : pos+vend])
-								needVcode = v != "" && v != "0"
-							}
-						}
-						break
-					} else if swire == 0 {
-						_, snp2, ok := autoreplyReadVarint(data[pos:end], spos)
-						if !ok {
-							break
-						}
-						spos = snp2
-					} else if swire == 2 {
-						slen, snp2, ok := autoreplyReadVarint(data[pos:end], spos)
-						if !ok {
-							break
-						}
-						spos = snp2 + int(slen)
-					} else {
-						break
-					}
-				}
-			}
-			pos = end
-		} else {
-			break
-		}
-	}
-	return needVcode
-}
-
-func autoreplySkipField(data []byte, pos, wireType int) int {
-	switch wireType {
-	case 0:
-		_, np, ok := autoreplyReadVarint(data, pos)
-		if !ok {
-			return -1
-		}
-		return np
-	case 1:
-		return pos + 8
-	case 2:
-		length, np, ok := autoreplyReadVarint(data, pos)
-		if !ok {
-			return -1
-		}
-		return np + int(length)
-	case 5:
-		return pos + 4
-	}
-	return -1
-}
-
-func autoreplyParseResponse(binary []byte) (errorno int, errmsg string, needVcode bool) {
-	pos := 0
-	for pos < len(binary) {
-		tag, newPos, ok := autoreplyReadVarint(binary, pos)
-		if !ok {
-			break
-		}
-		pos = newPos
-		fieldNumber := int(tag >> 3)
-		wireType := int(tag & 0x07)
-		switch wireType {
-		case 0:
-			_, np, ok := autoreplyReadVarint(binary, pos)
-			if !ok {
-				return
-			}
-			pos = np
-		case 1:
-			pos += 8
-		case 2:
-			length, np, ok := autoreplyReadVarint(binary, pos)
-			if !ok {
-				return
-			}
-			pos = np
-			end := pos + int(length)
-			if end > len(binary) {
-				return
-			}
-			sub := binary[pos:end]
-			if fieldNumber == 1 {
-				errorno, errmsg = autoreplyParseError(sub)
-			} else if fieldNumber == 2 {
-				needVcode = autoreplyParseNeedVcode(sub)
-			}
-			pos = end
-		case 5:
-			pos += 4
-		default:
-			return
-		}
-	}
-	return
-}
-
 type autoreplyAddPostResult struct {
 	Success   bool   `json:"success"`
 	ErrorCode int    `json:"error_code"`
@@ -657,30 +257,100 @@ func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(co
 	return nil, lastErr
 }
 
+// autoreplyParseNeedVcodeJSON 判断极速版发帖 JSON 响应是否要求验证码。
+// 贴吧回复响应里的 vcode 信息可能出现在顶层或 data 下。
+func autoreplyParseNeedVcodeJSON(result map[string]any) bool {
+	if result == nil {
+		return false
+	}
+	check := func(v any) bool {
+		switch x := v.(type) {
+		case map[string]any:
+			return weltolkToInt64(x["need_vcode"]) != 0 ||
+				weltolkToInt64(x["need_v_code"]) != 0 ||
+				weltolkToString(x["captcha_vcode_str"]) != ""
+		case string:
+			return x != "" && x != "0"
+		case json.Number:
+			s := x.String()
+			return s != "" && s != "0"
+		}
+		return false
+	}
+	if check(result["vcode"]) {
+		return true
+	}
+	if data, ok := result["data"].(map[string]any); ok {
+		if check(data["vcode"]) {
+			return true
+		}
+	}
+	return false
+}
+
+// autoreplyAddPost 使用极速版表单 + MD5 签名方式发送回复。
+// 对应极速版 com.baidu.tieba.tbadkCore.c.a 的 case 1（回复主题）与 case 2（楼中楼回复）。
 func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) autoreplyAddPostResult {
-	protoBinary := autoreplyBuildPostProto(bduss, stoken, tbs, fname, fid, tid, content, showName, quoteID, replyUID, floorNum, subPostID)
+	secret := "tiebaclient!!!"
+	fidStr := strconv.FormatInt(fid, 10)
+	tidStr := strconv.FormatInt(tid, 10)
 
-	boundary := "-*_r1999"
-	var body bytes.Buffer
-	body.WriteString("--" + boundary + "\r\n")
-	body.WriteString("Content-Disposition: form-data; name=\"data\"; filename=\"file\"\r\n\r\n")
-	body.Write(protoBinary)
-	body.WriteString("\r\n--" + boundary + "--\r\n")
+	params := map[string]string{
+		"BDUSS":         bduss,
+		"tbs":           tbs,
+		"content":       content,
+		"reply_uid":     replyUID,
+		"name_show":     showName,
+		"fid":           fidStr,
+		"from_fourm_id": "",
+		"v_fid":         "",
+		"v_fname":       "",
+		"tid":           tidStr,
+		"kw":            fname,
+	}
+	if quoteID == "" {
+		params["is_ad"] = "0"
+		params["is_barrage"] = "0"
+		params["barrage_time"] = "0"
+	} else {
+		params["quote_id"] = quoteID
+		params["is_twzhibo_thread"] = "0"
+		params["floor_num"] = floorNum
+		if subPostID != "" {
+			params["repostid"] = subPostID
+		}
+		params["is_ad"] = "0"
+		params["is_addition"] = "0"
+		params["is_giftpost"] = "0"
+	}
 
-	targetURL := "https://tiebac.baidu.com/c/c/post/add?cmd=309731"
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var raw strings.Builder
+	for _, k := range keys {
+		raw.WriteString(k + "=" + params[k])
+	}
+	params["sign"] = _function.Md5(raw.String() + secret)
+
+	body := url.Values{}
+	for k, v := range params {
+		body.Set(k, v)
+	}
+
 	ctx := context.Background()
+	targetURL := "https://tiebac.baidu.com/c/c/post/add"
 
 	do := func(reqCtx context.Context) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(body.Bytes()))
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, strings.NewReader(body.Encode()))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
-		req.Header.Set("User-Agent", "tieba/12.35.1.0")
-		req.Header.Set("x_bd_data_type", "protobuf")
-		req.Header.Set("Accept-Encoding", "gzip")
-		req.Header.Set("Connection", "keep-alive")
-		req.Header.Set("Cookie", "BDUSS="+bduss+"; STOKEN="+stoken+";")
+		req.Header.Set("User-Agent", "bdtb for Android 12.41.7.1")
+		req.Header.Set("Cookie", "ka=open; BDUSS="+url.QueryEscape(bduss))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		client := &http.Client{
 			Timeout:   60 * time.Second,
@@ -696,37 +366,38 @@ func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content,
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var raw bytes.Buffer
-		io.CopyN(&raw, resp.Body, 512)
+		var rawBuf bytes.Buffer
+		io.CopyN(&rawBuf, resp.Body, 512)
 		errMsg := "HTTP Error: " + strconv.Itoa(resp.StatusCode)
-		if raw.Len() > 0 {
-			errMsg += " body: " + raw.String()
+		if rawBuf.Len() > 0 {
+			errMsg += " body: " + rawBuf.String()
 		}
 		return autoreplyAddPostResult{Success: false, ErrorCode: resp.StatusCode, ErrorMsg: errMsg}
 	}
 
-	var reader io.Reader = resp.Body
-	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		gr, err := gzip.NewReader(reader)
-		if err == nil {
-			defer gr.Close()
-			reader = gr
-		}
-	}
-	response, err := io.ReadAll(reader)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "Read Error: " + err.Error()}
 	}
-	if len(response) == 0 {
+	if len(respBody) == 0 {
 		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "empty response body"}
 	}
 
-	errorno, errmsg, needVcode := autoreplyParseResponse(response)
+	var result map[string]any
+	dec := json.NewDecoder(bytes.NewReader(respBody))
+	dec.UseNumber()
+	if err := dec.Decode(&result); err != nil {
+		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "JSON Decode Error: " + err.Error()}
+	}
+
+	errorCode := int(weltolkToInt64(result["error_code"]))
+	errMsg, _ := result["error_msg"].(string)
+
 	return autoreplyAddPostResult{
-		Success:   errorno == 0,
-		ErrorCode: errorno,
-		ErrorMsg:  errmsg,
-		NeedVcode: needVcode,
+		Success:   errorCode == 0,
+		ErrorCode: errorCode,
+		ErrorMsg:  errMsg,
+		NeedVcode: autoreplyParseNeedVcodeJSON(result),
 	}
 }
 
