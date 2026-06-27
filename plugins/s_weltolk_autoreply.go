@@ -84,6 +84,7 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 			{Method: http.MethodDelete, Path: "list/:id", Function: PluginWeltolkAutoReplyListDelete},
 			{Method: http.MethodPost, Path: "list/:id/toggle", Function: PluginWeltolkAutoReplyListToggle},
 			{Method: http.MethodPost, Path: "list/empty", Function: PluginWeltolkAutoReplyListEmpty},
+			{Method: http.MethodPost, Path: "diagnose", Function: PluginWeltolkAutoReplyDiagnose},
 			{Method: http.MethodPost, Path: "test", Function: PluginWeltolkAutoReplyTest},
 		},
 	},
@@ -239,16 +240,25 @@ func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(co
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		resp, err := do(attemptCtx)
-		cancel()
 		if err == nil {
 			// 429 Too Many Requests 和 5xx 服务端错误值得重试
 			if resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
 				lastErr = fmt.Errorf("server returned status %d", resp.StatusCode)
 				resp.Body.Close()
+				cancel()
 				continue
 			}
+			// 缓存响应体使其脱离 attemptCtx 再 cancel：避免调用方读 body 时因 context 已取消而报 context canceled
+			buf, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			cancel()
+			if readErr != nil {
+				return nil, readErr
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(buf))
 			return resp, nil
 		}
+		cancel()
 		lastErr = err
 		if !autoreplyIsRetryableErr(err) {
 			return nil, err
@@ -604,6 +614,7 @@ func pbpIterate(data []byte, handler func(fieldNumber, wireType, pos, end int) b
 				return
 			}
 			end = np + int(length)
+			pos = np
 		case 5:
 			end = pos + 4
 		default:
@@ -701,17 +712,21 @@ func weltolkPbPageRequest(tid int64, bduss, stoken string, pn, rn int) ([]byte, 
 		req.Header.Set("Cookie", "BDUSS="+bduss+"; STOKEN="+stoken+";")
 
 		client := &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: _function.TBClient.Transport,
+			Timeout: 30 * time.Second,
+		}
+		if _function.TBClient != nil && _function.TBClient.Transport != nil {
+			client.Transport = _function.TBClient.Transport
 		}
 		return client.Do(req)
 	}
 
 	resp, err := autoreplyDoWithRetry(ctx, 30*time.Second, do)
 	if err != nil {
+		slog.Warn("plugin.weltolk-autoreply.pbpage.request.error", "tid", tid, "pn", pn, "rn", rn, "error", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
+	slog.Debug("plugin.weltolk-autoreply.pbpage.request", "tid", tid, "pn", pn, "rn", rn, "status", resp.StatusCode, "content_encoding", resp.Header.Get("Content-Encoding"))
 
 	var reader io.Reader = resp.Body
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
@@ -721,7 +736,16 @@ func weltolkPbPageRequest(tid int64, bduss, stoken string, pn, rn int) ([]byte, 
 			reader = gr
 		}
 	}
-	return io.ReadAll(reader)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		slog.Warn("plugin.weltolk-autoreply.pbpage.request.read-error", "tid", tid, "error", err)
+		return nil, err
+	}
+	if len(data) == 0 {
+		slog.Warn("plugin.weltolk-autoreply.pbpage.request.empty", "tid", tid, "pn", pn, "rn", rn, "status", resp.StatusCode)
+	}
+	slog.Debug("plugin.weltolk-autoreply.pbpage.request.done", "tid", tid, "pn", pn, "rn", rn, "resp_len", len(data))
+	return data, nil
 }
 
 type pbpPageResult struct {
@@ -781,6 +805,11 @@ func weltolkPbPageParse(data []byte) *pbpPageResult {
 		}
 		return true
 	})
+	if result.errorno != 0 {
+		slog.Warn("plugin.weltolk-autoreply.pbpage.parse.error", "errorno", result.errorno, "errmsg", result.errmsg)
+	} else {
+		slog.Debug("plugin.weltolk-autoreply.pbpage.parse", "errorno", result.errorno, "reply_count", result.replyCount, "total_page", result.totalPage, "floors", len(result.floors))
+	}
 	return result
 }
 
@@ -906,21 +935,29 @@ func pbpParseSubPost(data []byte) *weltolkFloor {
 
 func weltolkGetReplyCount(tid int64, bduss, stoken string) (replyCount int64, totalPage int, ok bool) {
 	respData, err := weltolkPbPageRequest(tid, bduss, stoken, 1, 30)
-	if err != nil || len(respData) == 0 {
+	if err != nil {
+		slog.Warn("plugin.weltolk-autoreply.reply-count.request-fail", "tid", tid, "error", err)
+		return 0, 0, false
+	}
+	if len(respData) == 0 {
+		slog.Warn("plugin.weltolk-autoreply.reply-count.empty-resp", "tid", tid)
 		return 0, 0, false
 	}
 	result := weltolkPbPageParse(respData)
 	if result.errorno != 0 {
+		slog.Warn("plugin.weltolk-autoreply.reply-count.errorno", "tid", tid, "errorno", result.errorno, "errmsg", result.errmsg)
 		return 0, 0, false
 	}
 	if result.totalPage < 1 {
 		result.totalPage = 1
 	}
+	slog.Debug("plugin.weltolk-autoreply.reply-count", "tid", tid, "reply_count", result.replyCount, "total_page", result.totalPage, "floors", len(result.floors))
 	return result.replyCount, result.totalPage, true
 }
 
 // weltolkGetLastFloorContent 获取帖子的最新楼层内容。
 // 请求最后一页（pn=totalPage）并用较大 rn（30），取返回 post_list 的最后一个元素作为最新楼层。
+// 越界页兜底：若返回空且 pn>1，回退请求 pn=1。
 func weltolkGetLastFloorContent(tid int64, bduss, stoken string, limit, totalPage int) []*weltolkFloor {
 	pn := totalPage
 	if pn < 1 {
@@ -930,19 +967,39 @@ func weltolkGetLastFloorContent(tid int64, bduss, stoken string, limit, totalPag
 	if limit > rn {
 		rn = limit
 	}
-	respData, err := weltolkPbPageRequest(tid, bduss, stoken, pn, rn)
-	if err != nil || len(respData) == 0 {
-		return nil
+	fetch := func(p int) []*weltolkFloor {
+		respData, err := weltolkPbPageRequest(tid, bduss, stoken, p, rn)
+		if err != nil {
+			slog.Warn("plugin.weltolk-autoreply.last-floor.request-fail", "tid", tid, "pn", p, "rn", rn, "error", err)
+			return nil
+		}
+		if len(respData) == 0 {
+			slog.Warn("plugin.weltolk-autoreply.last-floor.empty-resp", "tid", tid, "pn", p)
+			return nil
+		}
+		result := weltolkPbPageParse(respData)
+		if result.errorno != 0 {
+			slog.Warn("plugin.weltolk-autoreply.last-floor.errorno", "tid", tid, "pn", p, "errorno", result.errorno, "errmsg", result.errmsg)
+			return nil
+		}
+		return result.floors
 	}
-	result := weltolkPbPageParse(respData)
-	if result.errorno != 0 || len(result.floors) == 0 {
+	floors := fetch(pn)
+	if len(floors) == 0 && pn > 1 {
+		slog.Warn("plugin.weltolk-autoreply.last-floor.fallback", "tid", tid, "orig_pn", pn, "total_page", totalPage)
+		floors = fetch(1)
+	}
+	if len(floors) == 0 {
+		slog.Warn("plugin.weltolk-autoreply.last-floor.empty", "tid", tid, "pn", pn, "total_page", totalPage)
 		return nil
 	}
 	// post_list 按楼层升序，最新楼层在最后。调用方依赖 [0] 是最新，故反转为降序。
-	for i, j := 0, len(result.floors)-1; i < j; i, j = i+1, j-1 {
-		result.floors[i], result.floors[j] = result.floors[j], result.floors[i]
+	for i, j := 0, len(floors)-1; i < j; i, j = i+1, j-1 {
+		floors[i], floors[j] = floors[j], floors[i]
 	}
-	return result.floors
+	latest := floors[0]
+	slog.Debug("plugin.weltolk-autoreply.last-floor", "tid", tid, "floor_count", len(floors), "latest_floor", latest.Floor, "latest_pid", latest.ID)
+	return floors
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
@@ -1929,4 +1986,75 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 
 	result := autoreplyAddPost(bduss, stoken, tbs, binding.Fname, fid, binding.Tid, content, "贴吧用户", quoteID, replyUID, floorNum, subPostID)
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", result, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyDiagnose(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	tidStr := c.FormValue("tid")
+	if tidStr == "" {
+		tidStr = c.QueryParam("tid")
+	}
+	tid, err := strconv.ParseInt(tidStr, 10, 64)
+	if err != nil || tid <= 0 {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "缺少或无效的 tid", _function.EchoEmptyObject, "tbsign"))
+	}
+	// 取该用户绑定的最小 pid 账号
+	var bind model.TcBaiduid
+	if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", uid).Order("id ASC").Take(&bind).Error; err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "未绑定百度账号", _function.EchoEmptyObject, "tbsign"))
+	}
+	cookie := _function.GetCookie(bind.ID, true)
+	if cookie == nil || cookie.Bduss == "" {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "未获取到BDUSS", _function.EchoEmptyObject, "tbsign"))
+	}
+	bduss := cookie.Bduss
+	stoken := cookie.Stoken
+
+	steps := []map[string]any{}
+	addStep := func(name string, ok bool, fields map[string]any) {
+		m := map[string]any{"step": name, "ok": ok}
+		for k, v := range fields {
+			m[k] = v
+		}
+		steps = append(steps, m)
+	}
+
+	// step1: pbpage_request
+	respData, err := weltolkPbPageRequest(tid, bduss, stoken, 1, 30)
+	if err != nil {
+		addStep("pbpage_request", false, map[string]any{"error": err.Error()})
+		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{"steps": steps, "summary": "pbpage_request 失败"}, "tbsign"))
+	}
+	addStep("pbpage_request", true, map[string]any{"resp_len": len(respData)})
+
+	// step2: parse
+	result := weltolkPbPageParse(respData)
+	parseOK := result.errorno == 0
+	addStep("parse", parseOK, map[string]any{"errorno": result.errorno, "errmsg": result.errmsg, "reply_count": result.replyCount, "total_page": result.totalPage, "floors": len(result.floors)})
+	if !parseOK {
+		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{"steps": steps, "summary": "parse errorno=" + strconv.Itoa(result.errorno)}, "tbsign"))
+	}
+
+	// step3: get_reply_count
+	replyCount, totalPage, okRC := weltolkGetReplyCount(tid, bduss, stoken)
+	addStep("get_reply_count", okRC, map[string]any{"reply_count": replyCount, "total_page": totalPage})
+	if !okRC {
+		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{"steps": steps, "summary": "get_reply_count 失败"}, "tbsign"))
+	}
+
+	// step4: get_last_floor
+	floors := weltolkGetLastFloorContent(tid, bduss, stoken, 1, totalPage)
+	floorFields := map[string]any{"floor_count": len(floors)}
+	if len(floors) > 0 {
+		floorFields["latest_floor"] = floors[0].Floor
+		floorFields["latest_pid"] = floors[0].ID
+		floorFields["latest_author"] = floors[0].Username
+	}
+	addStep("get_last_floor", len(floors) > 0, floorFields)
+
+	summary := "OK"
+	if len(floors) == 0 {
+		summary = "get_last_floor 返回空"
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{"steps": steps, "summary": summary}, "tbsign"))
 }
