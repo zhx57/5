@@ -634,7 +634,7 @@ func pbpReadInt64(data []byte, pos, end int) int64 {
 }
 
 // weltolkPbPageRequest 按极速版 protobuf 协议请求 c/f/pb/page，返回响应二进制
-func weltolkPbPageRequest(tid int64, bduss string, pn, rn int) ([]byte, error) {
+func weltolkPbPageRequest(tid int64, bduss, stoken string, pn, rn int) ([]byte, error) {
 	// DataReq
 	dataReq := bytes.NewBuffer(nil)
 	dataReq.Write(pbpEncodeInt32(2, 0))              // mark
@@ -655,12 +655,17 @@ func weltolkPbPageRequest(tid int64, bduss string, pn, rn int) ([]byte, error) {
 	commonReq := bytes.NewBuffer(nil)
 	commonReq.Write(pbpEncodeInt32(1, 2))                      // _client_type
 	commonReq.Write(pbpEncodeString(2, "12.41.7.1"))           // _client_version
+	commonReq.Write(pbpEncodeString(3, "888888888888888"))     // _client_id
 	commonReq.Write(pbpEncodeString(5, "000000000000000"))     // _phone_imei
+	commonReq.Write(pbpEncodeString(6, "app"))                 // from
 	commonReq.Write(pbpEncodeString(7, cuid))                  // cuid
 	commonReq.Write(pbpEncodeInt64(8, time.Now().UnixMilli())) // _timestamp
 	commonReq.Write(pbpEncodeString(9, "2201123C"))            // model
 	commonReq.Write(pbpEncodeString(10, bduss))                // BDUSS
-	dataReq.Write(pbpEncodeMessage(25, commonReq.Bytes()))     // common (字段25)
+	if stoken != "" {
+		commonReq.Write(pbpEncodeString(30, stoken)) // stoken（极速版 n.a() bl2=true 且 stoken 非空时填充）
+	}
+	dataReq.Write(pbpEncodeMessage(25, commonReq.Bytes())) // common (字段25)
 
 	// PbPageReqIdl{data=1}
 	reqBody := pbpEncodeMessage(1, dataReq.Bytes())
@@ -686,7 +691,7 @@ func weltolkPbPageRequest(tid int64, bduss string, pn, rn int) ([]byte, error) {
 		req.Header.Set("x_bd_data_type", "protobuf")
 		req.Header.Set("Accept-Encoding", "gzip")
 		req.Header.Set("Connection", "keep-alive")
-		req.Header.Set("Cookie", "BDUSS="+bduss+";")
+		req.Header.Set("Cookie", "BDUSS="+bduss+"; STOKEN="+stoken+";")
 
 		client := &http.Client{
 			Timeout:   30 * time.Second,
@@ -892,8 +897,8 @@ func pbpParseSubPost(data []byte) *weltolkFloor {
 	return floor
 }
 
-func weltolkGetReplyCount(tid int64, bduss string) (replyCount int64, totalPage int, ok bool) {
-	respData, err := weltolkPbPageRequest(tid, bduss, 1, 30)
+func weltolkGetReplyCount(tid int64, bduss, stoken string) (replyCount int64, totalPage int, ok bool) {
+	respData, err := weltolkPbPageRequest(tid, bduss, stoken, 1, 30)
 	if err != nil || len(respData) == 0 {
 		return 0, 0, false
 	}
@@ -909,7 +914,7 @@ func weltolkGetReplyCount(tid int64, bduss string) (replyCount int64, totalPage 
 
 // weltolkGetLastFloorContent 获取帖子的最新楼层内容。
 // 请求最后一页（pn=totalPage）并用较大 rn（30），取返回 post_list 的最后一个元素作为最新楼层。
-func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPage int) []*weltolkFloor {
+func weltolkGetLastFloorContent(tid int64, bduss, stoken string, limit, totalPage int) []*weltolkFloor {
 	pn := totalPage
 	if pn < 1 {
 		pn = 1
@@ -918,7 +923,7 @@ func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPage int) [
 	if limit > rn {
 		rn = limit
 	}
-	respData, err := weltolkPbPageRequest(tid, bduss, pn, rn)
+	respData, err := weltolkPbPageRequest(tid, bduss, stoken, pn, rn)
 	if err != nil || len(respData) == 0 {
 		return nil
 	}
@@ -1084,7 +1089,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 	bduss := cookie.Bduss
 	stoken := cookie.Stoken
 
-	replyCount, totalPage, ok := weltolkGetReplyCount(task.Tid, bduss)
+	replyCount, totalPage, ok := weltolkGetReplyCount(task.Tid, bduss, stoken)
 	if !ok || replyCount < 0 {
 		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取回复数失败", "执行结果：跳过：获取回复数失败")
 		return
@@ -1103,7 +1108,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 	newFloorLatestPid := int64(0)
 
 	if triggerMode != "keyword" {
-		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1, totalPage)
+		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, stoken, 1, totalPage)
 		latestPid := int64(0)
 		if len(latestFloors) > 0 {
 			latestPid = latestFloors[0].ID
@@ -1153,7 +1158,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		floorNum = ""
 		subPostID = ""
 
-		floors := weltolkGetLastFloorContent(task.Tid, bduss, 20, totalPage)
+		floors := weltolkGetLastFloorContent(task.Tid, bduss, stoken, 20, totalPage)
 		if len(floors) == 0 {
 			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "获取楼层内容失败", "执行结果：跳过：获取楼层内容失败")
 			return
@@ -1809,7 +1814,7 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 	atPortrait := ""
 
 	// 获取帖子总数以计算最后一页（获取最新楼层）
-	_, totalPage, replyOk := weltolkGetReplyCount(binding.Tid, bduss)
+	_, totalPage, replyOk := weltolkGetReplyCount(binding.Tid, bduss, stoken)
 	if !replyOk {
 		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "测试发帖失败：获取帖子信息失败", _function.EchoEmptyObject, "tbsign"))
 	}
@@ -1818,7 +1823,7 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 		if strings.TrimSpace(binding.MatchKeywords) == "" {
 			return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词模式但未设置关键词，将作为主题回复", _function.EchoEmptyObject, "tbsign"))
 		}
-		floors := weltolkGetLastFloorContent(binding.Tid, bduss, 20, totalPage)
+		floors := weltolkGetLastFloorContent(binding.Tid, bduss, stoken, 20, totalPage)
 		if len(floors) == 0 {
 			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "获取楼层内容失败，无法测试关键词匹配", _function.EchoEmptyObject, "tbsign"))
 		}
@@ -1869,7 +1874,7 @@ func PluginWeltolkAutoReplyTest(c echo.Context) error {
 			return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词未匹配任何楼层", _function.EchoEmptyObject, "tbsign"))
 		}
 	} else {
-		latestFloors := weltolkGetLastFloorContent(binding.Tid, bduss, 1, totalPage)
+		latestFloors := weltolkGetLastFloorContent(binding.Tid, bduss, stoken, 1, totalPage)
 		if len(latestFloors) > 0 {
 			latest := latestFloors[0]
 			floorNum = strconv.FormatInt(latest.Floor, 10)
