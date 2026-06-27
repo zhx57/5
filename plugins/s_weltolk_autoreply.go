@@ -657,7 +657,7 @@ func weltolkPbPageRequest(tid int64, bduss, stoken string, pn, rn int) ([]byte, 
 	commonReq.Write(pbpEncodeString(2, "12.41.7.1"))           // _client_version
 	commonReq.Write(pbpEncodeString(3, "888888888888888"))     // _client_id
 	commonReq.Write(pbpEncodeString(5, "000000000000000"))     // _phone_imei
-	commonReq.Write(pbpEncodeString(6, "app"))                 // from
+	commonReq.Write(pbpEncodeString(6, "1021099l")) // from（极速版渠道号，来源 TbadkCoreApplication.getFrom() → assets/channel）
 	commonReq.Write(pbpEncodeString(7, cuid))                  // cuid
 	commonReq.Write(pbpEncodeInt64(8, time.Now().UnixMilli())) // _timestamp
 	commonReq.Write(pbpEncodeString(9, "2201123C"))            // model
@@ -676,9 +676,16 @@ func weltolkPbPageRequest(tid int64, bduss, stoken string, pn, rn int) ([]byte, 
 	body.WriteString("--" + boundary + "\r\n")
 	body.WriteString("Content-Disposition: form-data; name=\"data\"; filename=\"file\"\r\n\r\n")
 	body.Write(reqBody)
-	body.WriteString("\r\n--" + boundary + "--\r\n")
+	body.WriteString("\r\n")
+	if stoken != "" {
+		body.WriteString("--" + boundary + "\r\n")
+		body.WriteString("Content-Disposition: form-data; name=\"STOKEN\"\r\n\r\n")
+		body.WriteString(stoken)
+		body.WriteString("\r\n")
+	}
+	body.WriteString("--" + boundary + "--\r\n")
 
-	targetURL := "https://tiebac.baidu.com/c/f/pb/page"
+	targetURL := "https://tiebac.baidu.com/c/f/pb/page?cmd=302001&format=protobuf"
 	ctx := context.Background()
 
 	do := func(reqCtx context.Context) (*http.Response, error) {
