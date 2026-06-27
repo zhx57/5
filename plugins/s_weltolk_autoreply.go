@@ -2,13 +2,13 @@ package _plugin
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	mrand "math/rand"
 	"net"
 	"net/http"
@@ -512,200 +512,425 @@ func weltolkParseAuthorName(author any, authorID int64) string {
 	return ""
 }
 
-func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[string]any, error) {
-	secret := "tiebaclient!!!"
-	stTime := autoreplyRandIntn(751) + 100
-	stSize := int64(math.Round((float64(autoreplyRandInt63())/float64(math.MaxInt64)*8 + 0.4) * float64(stTime)))
+// PbPage protobuf 编解码辅助（字段编号来自 n0099/tbclient.protobuf，与极速版 APK 一致）
+
+func pbpEncodeVarint(v uint64) []byte {
+	var buf [10]byte
+	var n int
+	for v >= 0x80 {
+		buf[n] = byte(v&0x7F | 0x80)
+		n++
+		v >>= 7
+	}
+	buf[n] = byte(v)
+	n++
+	return buf[:n]
+}
+
+func pbpEncodeTag(fieldNumber, wireType int) []byte {
+	return pbpEncodeVarint(uint64(fieldNumber<<3) | uint64(wireType))
+}
+
+func pbpEncodeString(fieldNumber int, s string) []byte {
+	b := []byte(s)
+	return bytes.Join([][]byte{
+		pbpEncodeTag(fieldNumber, 2),
+		pbpEncodeVarint(uint64(len(b))),
+		b,
+	}, nil)
+}
+
+func pbpEncodeInt32(fieldNumber int, v int32) []byte {
+	return append(pbpEncodeTag(fieldNumber, 0), pbpEncodeVarint(uint64(v))...)
+}
+
+func pbpEncodeInt64(fieldNumber int, v int64) []byte {
+	return append(pbpEncodeTag(fieldNumber, 0), pbpEncodeVarint(uint64(v))...)
+}
+
+func pbpEncodeMessage(fieldNumber int, data []byte) []byte {
+	return bytes.Join([][]byte{
+		pbpEncodeTag(fieldNumber, 2),
+		pbpEncodeVarint(uint64(len(data))),
+		data,
+	}, nil)
+}
+
+// 解码辅助
+func pbpReadVarint(data []byte, pos int) (uint64, int, bool) {
+	var value uint64
+	var shift uint
+	for pos < len(data) {
+		b := data[pos]
+		pos++
+		value |= uint64(b&0x7F) << shift
+		if b&0x80 == 0 {
+			return value, pos, true
+		}
+		shift += 7
+		if shift > 63 {
+			return 0, pos, false
+		}
+	}
+	return 0, pos, false
+}
+
+// pbpIterate 遍历 protobuf 消息字段，对每个字段调用 handler(fieldNumber, wireType, pos, end)
+// fieldData 对 wire type 0 是 varint 值的 bytes（已跳过），2 是子消息 bytes，1/5 已跳过
+// 返回 false 表示停止遍历
+func pbpIterate(data []byte, handler func(fieldNumber, wireType, pos, end int) bool) {
+	pos := 0
+	for pos < len(data) {
+		tag, np, ok := pbpReadVarint(data, pos)
+		if !ok {
+			return
+		}
+		pos = np
+		fieldNumber := int(tag >> 3)
+		wireType := int(tag & 0x07)
+		var end int
+		switch wireType {
+		case 0:
+			_, np, ok := pbpReadVarint(data, pos)
+			if !ok {
+				return
+			}
+			end = np
+		case 1:
+			end = pos + 8
+		case 2:
+			length, np, ok := pbpReadVarint(data, pos)
+			if !ok {
+				return
+			}
+			end = np + int(length)
+		case 5:
+			end = pos + 4
+		default:
+			return
+		}
+		if end > len(data) {
+			return
+		}
+		if !handler(fieldNumber, wireType, pos, end) {
+			return
+		}
+		pos = end
+	}
+}
+
+func pbpReadString(data []byte, pos, end int) string {
+	return string(data[pos:end])
+}
+
+func pbpReadInt32(data []byte, pos, end int) int32 {
+	v, _, _ := pbpReadVarint(data, pos)
+	return int32(v)
+}
+
+func pbpReadInt64(data []byte, pos, end int) int64 {
+	v, _, _ := pbpReadVarint(data, pos)
+	return int64(v)
+}
+
+// weltolkPbPageRequest 按极速版 protobuf 协议请求 c/f/pb/page，返回响应二进制
+func weltolkPbPageRequest(tid int64, bduss string, pn, rn int) ([]byte, error) {
+	// DataReq
+	dataReq := bytes.NewBuffer(nil)
+	dataReq.Write(pbpEncodeInt32(2, 0))              // mark
+	dataReq.Write(pbpEncodeInt32(3, 0))              // back
+	dataReq.Write(pbpEncodeInt64(4, tid))            // kz
+	dataReq.Write(pbpEncodeInt32(5, 0))              // lz
+	dataReq.Write(pbpEncodeInt32(6, 0))              // r
+	dataReq.Write(pbpEncodeInt32(8, 1))              // with_floor
+	dataReq.Write(pbpEncodeInt32(9, 3))              // floor_rn
+	dataReq.Write(pbpEncodeInt32(13, int32(rn)))     // rn
+	dataReq.Write(pbpEncodeInt32(14, 1080))          // scr_w
+	dataReq.Write(pbpEncodeInt32(15, 1920))          // scr_h
+	dataReq.Write(pbpEncodeInt32(18, int32(pn)))     // pn
+	dataReq.Write(pbpEncodeString(19, "tb_frslist")) // st_type
+
+	// CommonReq（DataReq 字段25，依据极速版 DataReq.java @ProtoField(tag=25) 与 n.a() 填充）
 	cuid := fmt.Sprintf("baidutiebaapp%08d", autoreplyRandIntn(90000000)+10000000)
+	commonReq := bytes.NewBuffer(nil)
+	commonReq.Write(pbpEncodeInt32(1, 2))                      // _client_type
+	commonReq.Write(pbpEncodeString(2, "12.41.7.1"))           // _client_version
+	commonReq.Write(pbpEncodeString(5, "000000000000000"))     // _phone_imei
+	commonReq.Write(pbpEncodeString(7, cuid))                  // cuid
+	commonReq.Write(pbpEncodeInt64(8, time.Now().UnixMilli())) // _timestamp
+	commonReq.Write(pbpEncodeString(9, "2201123C"))            // model
+	commonReq.Write(pbpEncodeString(10, bduss))                // BDUSS
+	dataReq.Write(pbpEncodeMessage(25, commonReq.Bytes()))     // common (字段25)
 
-	params := map[string]string{
-		"_client_type":    "2",
-		"_client_version": "12.41.7.1",
-		"_phone_imei":     "000000000000000",
-		"back":            "0",
-		"cuid":            cuid,
-		"floor_rn":        "3",
-		"from":            "tieba",
-		"kz":              strconv.FormatInt(tid, 10),
-		"lz":              "0",
-		"mark":            "0",
-		"model":           "2201123C",
-		"pn":              pn,
-		"r":               r,
-		"rn":              rn,
-		"stErrorNums":     "1",
-		"stMethod":        "1",
-		"stMode":          "1",
-		"stTimesNum":      "1",
-		"stTime":          strconv.Itoa(stTime),
-		"stSize":          strconv.FormatInt(stSize, 10),
-		"st_type":         "tb_frslist",
-		"with_floor":      "1",
-	}
+	// PbPageReqIdl{data=1}
+	reqBody := pbpEncodeMessage(1, dataReq.Bytes())
 
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var raw strings.Builder
-	for _, k := range keys {
-		raw.WriteString(k + "=" + params[k])
-	}
-	params["sign"] = _function.Md5(raw.String() + secret)
+	// multipart/form-data，data 字段放 protobuf 二进制
+	boundary := "-*_r1999"
+	var body bytes.Buffer
+	body.WriteString("--" + boundary + "\r\n")
+	body.WriteString("Content-Disposition: form-data; name=\"data\"; filename=\"file\"\r\n\r\n")
+	body.Write(reqBody)
+	body.WriteString("\r\n--" + boundary + "--\r\n")
 
-	body := url.Values{}
-	for k, v := range params {
-		body.Set(k, v)
-	}
-
-	headers := map[string]string{
-		"User-Agent": "bdtb for Android 12.41.7.1",
-		"Cookie":     "ka=open; BDUSS=" + url.QueryEscape(bduss),
-	}
-
+	targetURL := "https://tiebac.baidu.com/c/f/pb/page"
 	ctx := context.Background()
-	targetURL := "http://c.tieba.baidu.com/c/f/pb/page"
 
 	do := func(reqCtx context.Context) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, strings.NewReader(body.Encode()))
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(body.Bytes()))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", headers["User-Agent"])
-		req.Header.Set("Cookie", headers["Cookie"])
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+		req.Header.Set("User-Agent", "bdtb for Android 12.41.7.1")
+		req.Header.Set("x_bd_data_type", "protobuf")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Cookie", "BDUSS="+bduss+";")
 
 		client := &http.Client{
-			Timeout:   15 * time.Second,
+			Timeout:   30 * time.Second,
 			Transport: _function.TBClient.Transport,
 		}
 		return client.Do(req)
 	}
 
-	resp, err := autoreplyDoWithRetry(ctx, 15*time.Second, do)
+	resp, err := autoreplyDoWithRetry(ctx, 30*time.Second, do)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	var reader io.Reader = resp.Body
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gr, err := gzip.NewReader(reader)
+		if err == nil {
+			defer gr.Close()
+			reader = gr
+		}
 	}
-	if len(respBody) == 0 {
-		return nil, errors.New("empty response")
-	}
+	return io.ReadAll(reader)
+}
 
-	var result map[string]any
-	dec := json.NewDecoder(bytes.NewReader(respBody))
-	dec.UseNumber()
-	if err := dec.Decode(&result); err != nil {
-		return nil, err
+type pbpPageResult struct {
+	errorno    int
+	errmsg     string
+	replyCount int64
+	totalPage  int
+	floors     []*weltolkFloor
+}
+
+func weltolkPbPageParse(data []byte) *pbpPageResult {
+	result := &pbpPageResult{}
+	pbpIterate(data, func(fieldNumber, wireType, pos, end int) bool {
+		if wireType != 2 {
+			return true
+		}
+		sub := data[pos:end]
+		switch fieldNumber {
+		case 1: // error
+			pbpIterate(sub, func(fn, wt, p, e int) bool {
+				if wt == 0 && fn == 1 {
+					result.errorno = int(pbpReadInt32(sub, p, e))
+				} else if wt == 2 && fn == 2 {
+					result.errmsg = pbpReadString(sub, p, e)
+				}
+				return true
+			})
+		case 2: // data
+			pbpIterate(sub, func(fn, wt, p, e int) bool {
+				if wt != 2 {
+					return true
+				}
+				subData := sub[p:e]
+				switch fn {
+				case 3: // page
+					pbpIterate(subData, func(pfn, pwt, pp, pe int) bool {
+						if pwt == 0 && pfn == 5 {
+							result.totalPage = int(pbpReadInt32(subData, pp, pe))
+						}
+						return true
+					})
+				case 6: // post_list (repeated)
+					floor := pbpParsePost(subData)
+					if floor != nil {
+						result.floors = append(result.floors, floor)
+					}
+				case 8: // thread
+					pbpIterate(subData, func(tfn, twt, tp, te int) bool {
+						if twt == 0 && tfn == 4 {
+							result.replyCount = int64(pbpReadInt32(subData, tp, te))
+						}
+						return true
+					})
+				}
+				return true
+			})
+		}
+		return true
+	})
+	return result
+}
+
+func pbpParsePost(data []byte) *weltolkFloor {
+	floor := &weltolkFloor{}
+	pbpIterate(data, func(fn, wt, pos, end int) bool {
+		switch fn {
+		case 1: // id
+			if wt == 0 {
+				floor.ID = pbpReadInt64(data, pos, end)
+			}
+		case 3: // floor
+			if wt == 0 {
+				floor.Floor = int64(pbpReadInt32(data, pos, end))
+			}
+		case 5: // content (repeated PbContent)
+			if wt == 2 {
+				text := pbpParseContent(data[pos:end])
+				if text != "" {
+					if floor.Content != "" {
+						floor.Content += "\n"
+					}
+					floor.Content += text
+				}
+			}
+		case 15: // sub_post_list
+			if wt == 2 {
+				floor.SubPosts = pbpParseSubPostList(data[pos:end])
+			}
+		case 19: // author_id
+			if wt == 0 {
+				floor.AuthorID = pbpReadInt64(data, pos, end)
+			}
+		case 23: // author (User)
+			if wt == 2 {
+				nameShow, portrait := pbpParseUser(data[pos:end])
+				if nameShow != "" {
+					floor.Username = nameShow
+				}
+				floor.Portrait = portrait
+			}
+		}
+		return true
+	})
+	if floor.Username == "" && floor.AuthorID != 0 {
+		floor.Username = fmt.Sprintf("用户%d", floor.AuthorID)
 	}
-	return result, nil
+	return floor
+}
+
+func pbpParseContent(data []byte) string {
+	text := ""
+	pbpIterate(data, func(fn, wt, pos, end int) bool {
+		if fn == 2 && wt == 2 {
+			text = pbpReadString(data, pos, end)
+			return false
+		}
+		return true
+	})
+	return text
+}
+
+func pbpParseUser(data []byte) (nameShow, portrait string) {
+	pbpIterate(data, func(fn, wt, pos, end int) bool {
+		if wt == 2 {
+			if fn == 2 {
+				portrait = pbpReadString(data, pos, end)
+			} else if fn == 4 {
+				nameShow = pbpReadString(data, pos, end)
+			} else if fn == 1 && nameShow == "" {
+				nameShow = pbpReadString(data, pos, end)
+			}
+		}
+		return true
+	})
+	return
+}
+
+func pbpParseSubPostList(data []byte) []*weltolkFloor {
+	var result []*weltolkFloor
+	pbpIterate(data, func(fn, wt, pos, end int) bool {
+		if fn == 1 && wt == 2 {
+			sp := pbpParseSubPost(data[pos:end])
+			if sp != nil {
+				result = append(result, sp)
+			}
+		}
+		return true
+	})
+	return result
+}
+
+func pbpParseSubPost(data []byte) *weltolkFloor {
+	floor := &weltolkFloor{}
+	pbpIterate(data, func(fn, wt, pos, end int) bool {
+		switch fn {
+		case 1: // id
+			if wt == 0 {
+				floor.ID = pbpReadInt64(data, pos, end)
+			}
+		case 4: // content (repeated PbContent)
+			if wt == 2 {
+				text := pbpParseContent(data[pos:end])
+				if text != "" {
+					if floor.Content != "" {
+						floor.Content += "\n"
+					}
+					floor.Content += text
+				}
+			}
+		case 8: // author_id
+			if wt == 0 {
+				floor.AuthorID = pbpReadInt64(data, pos, end)
+			}
+		}
+		return true
+	})
+	if floor.Username == "" && floor.AuthorID != 0 {
+		floor.Username = fmt.Sprintf("用户%d", floor.AuthorID)
+	}
+	return floor
 }
 
 func weltolkGetReplyCount(tid int64, bduss string) (replyCount int64, totalPage int, ok bool) {
-	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, "1", "1", "0")
-	if err != nil || resp == nil {
+	respData, err := weltolkPbPageRequest(tid, bduss, 1, 30)
+	if err != nil || len(respData) == 0 {
 		return 0, 0, false
 	}
-	thread, hasThread := resp["thread"].(map[string]any)
-	if !hasThread {
+	result := weltolkPbPageParse(respData)
+	if result.errorno != 0 {
 		return 0, 0, false
 	}
-	v, hasReplyNum := thread["reply_num"]
-	if !hasReplyNum {
-		return 0, 0, false
+	if result.totalPage < 1 {
+		result.totalPage = 1
 	}
-	replyCount = weltolkToInt64(v)
-	// 从 page 信息获取总页数（rn=1 时 total_page 即为帖子总数）
-	if page, ok := resp["page"].(map[string]any); ok {
-		totalPage = int(weltolkToInt64(page["total_page"]))
-	}
-	if totalPage < 1 {
-		totalPage = 1
-	}
-	return replyCount, totalPage, true
+	return result.replyCount, result.totalPage, true
 }
 
 // weltolkGetLastFloorContent 获取帖子的最新楼层内容。
-// totalPage 为贴吧 API 返回的总页数，直接作为最后一页页码请求，
-// 确保获取的是最新楼层而非第一页的旧楼层。
+// 请求最后一页（pn=totalPage）并用较大 rn（30），取返回 post_list 的最后一个元素作为最新楼层。
 func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPage int) []*weltolkFloor {
-	// 直接使用总页数作为最后一页页码
 	pn := totalPage
 	if pn < 1 {
 		pn = 1
 	}
-	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, strconv.Itoa(pn), strconv.Itoa(limit), "0")
-	if err != nil || resp == nil {
+	rn := 30
+	if limit > rn {
+		rn = limit
+	}
+	respData, err := weltolkPbPageRequest(tid, bduss, pn, rn)
+	if err != nil || len(respData) == 0 {
 		return nil
 	}
-	postListRaw, ok := resp["post_list"].([]any)
-	if !ok || len(postListRaw) == 0 {
+	result := weltolkPbPageParse(respData)
+	if result.errorno != 0 || len(result.floors) == 0 {
 		return nil
 	}
-
-	var result []*weltolkFloor
-	for _, postRaw := range postListRaw {
-		post, ok := postRaw.(map[string]any)
-		if !ok {
-			continue
-		}
-		authorID := weltolkToInt64(post["author_id"])
-		username := ""
-		portrait := ""
-		if authorID != 0 {
-			username = fmt.Sprintf("用户%d", authorID)
-		}
-		if author, ok := post["author"].(map[string]any); ok {
-			portrait = weltolkToString(author["portrait"])
-			if n := weltolkParseAuthorName(author, authorID); n != "" {
-				username = n
-			}
-		}
-
-		floor := &weltolkFloor{
-			ID:       weltolkToInt64(post["id"]),
-			AuthorID: authorID,
-			Floor:    weltolkToInt64(post["floor"]),
-			Username: username,
-			Portrait: portrait,
-			Content:  weltolkExtractTextContent(post["content"]),
-		}
-
-		if splRaw, ok := post["sub_post_list"].(map[string]any); ok {
-			if subListRaw, ok := splRaw["sub_post_list"].([]any); ok {
-				for _, spRaw := range subListRaw {
-					sp, ok := spRaw.(map[string]any)
-					if !ok {
-						continue
-					}
-					spAuthorID := weltolkToInt64(sp["author_id"])
-					spUsername := ""
-					spPortrait := ""
-					if spAuthor, ok := sp["author"].(map[string]any); ok {
-						spPortrait = weltolkToString(spAuthor["portrait"])
-						spUsername = weltolkParseAuthorName(spAuthor, spAuthorID)
-					}
-					if spUsername == "" && spAuthorID != 0 {
-						spUsername = fmt.Sprintf("用户%d", spAuthorID)
-					}
-					floor.SubPosts = append(floor.SubPosts, &weltolkFloor{
-						ID:       weltolkToInt64(sp["id"]),
-						AuthorID: spAuthorID,
-						Username: spUsername,
-						Portrait: spPortrait,
-						Content:  weltolkExtractTextContent(sp["content"]),
-					})
-				}
-			}
-		}
-		result = append(result, floor)
+	// post_list 按楼层升序，最新楼层在最后。调用方依赖 [0] 是最新，故反转为降序。
+	for i, j := 0, len(result.floors)-1; i < j; i, j = i+1, j-1 {
+		result.floors[i], result.floors[j] = result.floors[j], result.floors[i]
 	}
-	return result
+	return result.floors
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
