@@ -739,6 +739,11 @@ func weltolkAutoreplyProcessUser(uid string, now int64, logTime string) {
 		}
 	}()
 
+	// 检查用户级总开关，关闭时跳过该用户全部任务（不推进高水位，重新开启后可补回）
+	if _function.GetUserOption(weltolkAutoreplyOpenKey, uid) == "0" {
+		return
+	}
+
 	highWaterKey := weltolkAutoreplyHighWaterKey + "_" + uid
 	highWater, _ := strconv.Atoi(_function.GetOption(highWaterKey))
 	if highWater < 0 {
@@ -870,6 +875,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 	}
 	allowReplied := task.AllowReplied == 1
 	keywordMaxSeenPid := int64(0)
+	newFloorLatestPid := int64(0)
 
 	if triggerMode != "keyword" {
 		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1, totalPage)
@@ -877,6 +883,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 		if len(latestFloors) > 0 {
 			latestPid = latestFloors[0].ID
 		}
+		newFloorLatestPid = latestPid
 		if !allowReplied && latestPid <= task.LastRepliedPid {
 			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "没有新楼层", "执行结果：跳过：没有新楼层")
 			return
@@ -1066,7 +1073,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 			if triggerMode == "keyword" {
 				newLastRepliedPid = keywordMaxSeenPid
 			} else {
-				newLastRepliedPid = weltolkToInt64(quoteID)
+				newLastRepliedPid = newFloorLatestPid
 			}
 		}
 		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
@@ -1097,7 +1104,7 @@ func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64,
 			if triggerMode == "keyword" {
 				vcodePid = keywordMaxSeenPid
 			} else {
-				vcodePid = weltolkToInt64(quoteID)
+				vcodePid = newFloorLatestPid
 			}
 		}
 		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
@@ -1196,15 +1203,16 @@ func (pluginInfo *WeltolkAutoReplyPluginType) Reset(uid, pid, tid int32) error {
 		_sql = _sql.Where("id = ?", tid)
 	}
 	return _sql.Updates(map[string]any{
-		"enabled":     1,
-		"retry_count": 0,
-		"last_status": "",
-		"last_error":  "",
+		"enabled":       1,
+		"retry_count":   0,
+		"success_count": 0,
+		"last_status":   "",
+		"last_error":    "",
 	}).Error
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) ExportAccount(uid int32, tx *gorm.DB) (map[string]any, error) {
-	if !pluginInfo.GetSwitch() {
+	if _function.GetUserOption(weltolkAutoreplyOpenKey, strconv.Itoa(int(uid))) == "0" {
 		return nil, nil
 	}
 	tableName := (&model.TcWeltolkAutoreplyTasks{}).TableName()
@@ -1219,8 +1227,8 @@ func (pluginInfo *WeltolkAutoReplyPluginType) ExportAccount(uid int32, tx *gorm.
 }
 
 func (pluginInfo *WeltolkAutoReplyPluginType) ImportAccount(uid int32, pid map[int32]int32, data map[string]json.RawMessage, tx *gorm.DB) error {
-	if !pluginInfo.GetSwitch() {
-		return errors.New("plugin is not enabled")
+	if _function.GetUserOption(weltolkAutoreplyOpenKey, strconv.Itoa(int(uid))) == "0" {
+		return errors.New("自动回帖未开启")
 	}
 	if tx == nil {
 		tx = _function.GormDB.W
